@@ -5,7 +5,7 @@ edition = "2021"
 license = "Apache-2.0"
 
 [dependencies]
-cc_teec = { package = "rust-libteec", path = "../../rust-libteec" }
+cc_teec = { package = "rust-libteec", git = "https://gitee.com/jose47/rust-libteec.git", branch = "feat/chunk-size-4096" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = "1"

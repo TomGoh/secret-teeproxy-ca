@@ -786,6 +786,7 @@ dependencies = [
 [[package]]
 name = "rust-libteec"
 version = "0.1.0"
+source = "git+https://gitee.com/jose47/rust-libteec.git?branch=feat%2Fchunk-size-4096#9d98fe525de7e41cf4dc39b2fff7e461b70e6dc5"
 dependencies = [
  "bytemuck",
  "dashmap",
@@ -953,6 +954,7 @@ dependencies = [
 [[package]]
 name = "teec-api-types"
 version = "0.1.0"
+source = "git+https://gitee.com/jose47/rust-libteec.git?branch=feat%2Fchunk-size-4096#9d98fe525de7e41cf4dc39b2fff7e461b70e6dc5"
 
 [[package]]
 name = "thiserror"
