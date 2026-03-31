@@ -15,6 +15,9 @@
 //!   secret_proxy_ca remove-key --slot <N>
 //!   secret_proxy_ca add-whitelist --pattern <url-prefix>
 //!   secret_proxy_ca proxy --slot <N> --url <https://...> --body <json>
+//!   secret_proxy_ca serve [--port 18800]
+
+mod serve;
 
 use std::{collections::HashMap, mem};
 use std::io::{Read, Write};
@@ -30,26 +33,26 @@ use uuid::Uuid;
 /// TA UUID — must match `TA_UUID` in `secret_proxy_ta/src/main.rs`.
 /// The `teec_cc_bridge` uses this to locate the TA's Unix socket at
 /// `/tmp/{uuid}.sock`.
-const TA_UUID: &str = "a3f79c15-72d0-4e3a-b8d1-9f2ca3e81054";
+pub(crate) const TA_UUID: &str = "a3f79c15-72d0-4e3a-b8d1-9f2ca3e81054";
 
 /// GP TEE command IDs — must match the constants in `secret_proxy_ta/src/main.rs`.
 /// These are passed as `cmd_id` to `TEEC_InvokeCommand()`.
 
-const CMD_PROXY_REQUEST:  u32 = 0x0001;
+pub(crate) const CMD_PROXY_REQUEST:  u32 = 0x0001;
 const CMD_PROVISION_KEY:  u32 = 0x0002;
 const CMD_REMOVE_KEY:     u32 = 0x0003;
 const CMD_LIST_SLOTS:     u32 = 0x0004;
 const CMD_ADD_WHITELIST:  u32 = 0x0005;
-const CMD_RELAY_DATA:     u32 = 0x0006;
+pub(crate) const CMD_RELAY_DATA:     u32 = 0x0006;
 
 /// Business result codes returned in `params[1].value.a` by the TA.
 /// Must match the constants in `secret_proxy_ta/src/main.rs`.
 
 const BIZ_SUCCESS:           u32 = 0x900D;
-const BIZ_RELAY_START:       u32 = 0x9001;
-const BIZ_RELAY_CONTINUE:    u32 = 0x9002;
-const BIZ_RELAY_DONE:        u32 = 0x9003;
-const BIZ_RELAY_STREAMING:   u32 = 0x9004;
+pub(crate) const BIZ_RELAY_START:       u32 = 0x9001;
+pub(crate) const BIZ_RELAY_CONTINUE:    u32 = 0x9002;
+pub(crate) const BIZ_RELAY_DONE:        u32 = 0x9003;
+pub(crate) const BIZ_RELAY_STREAMING:   u32 = 0x9004;
 const BIZ_ERR_BAD_JSON:      u32 = 0xE001;
 const BIZ_ERR_KEY_NOT_FOUND: u32 = 0xE004;
 const BIZ_ERR_FORBIDDEN:     u32 = 0xE005;
@@ -64,7 +67,7 @@ const BIZ_ERR_TRANSPORT:     u32 = 0xE006;
 /// HTTP method enum — serialized as JSON variant name ("Get", "Post", etc.).
 #[derive(Debug, Serialize, Deserialize)]
 #[allow(dead_code)]
-enum HttpMethod {
+pub(crate) enum HttpMethod {
     Get,
     Post,
     Put,
@@ -81,7 +84,7 @@ enum HttpMethod {
 /// `body` is a byte array (Vec<u8>) because JSON serializes it as an integer
 /// array — this avoids encoding issues with non-UTF-8 data.
 #[derive(Debug, Serialize, Deserialize)]
-struct ProxyRequest {
+pub(crate) struct ProxyRequest {
     /// Key slot index — the TA looks up the API key by this ID.
     key_id: u32,
     /// Target HTTPS URL (e.g. "https://api.minimax.chat/v1/text/chatcompletion_v2").
@@ -161,6 +164,11 @@ fn run() -> Result<(), String> {
     if args.len() < 2 {
         print_usage(&args[0]);
         return Ok(());
+    }
+
+    // `serve` manages its own TEEC lifecycle (long-lived session)
+    if args[1] == "serve" {
+        return serve::cmd_serve(&args[2..]);
     }
 
     let ta_uuid = parse_uuid(TA_UUID)?;
@@ -398,11 +406,17 @@ fn cmd_proxy(session: &mut raw::TEEC_Session, args: &[String]) -> Result<(), Str
         other    => return Err(format!("unknown method: {other}")),
     };
 
+    let mut headers = HashMap::from([("Content-Type".into(), "application/json".into())]);
+    // Anthropic-compatible endpoints require this version header
+    if url.contains("/anthropic/") {
+        headers.insert("anthropic-version".into(), "2023-06-01".into());
+    }
+
     let req = ProxyRequest {
         key_id: slot,
         endpoint_url: url,
         method,
-        headers: HashMap::from([("Content-Type".into(), "application/json".into())]),
+        headers,
         body: body_str.into_bytes(),
     };
     let mut json = serde_json::to_vec(&req).map_err(|e| format!("serialize error: {e}"))?;
@@ -636,7 +650,7 @@ fn relay_loop(
 /// # Returns
 /// `Ok(TEEC_UUID)` on success.  The struct fields (timeLow, timeMid, etc.)
 /// are populated from the UUID's binary representation.
-fn parse_uuid(s: &str) -> Result<raw::TEEC_UUID, String> {
+pub(crate) fn parse_uuid(s: &str) -> Result<raw::TEEC_UUID, String> {
     Uuid::parse_str(s)
         .map(|u| {
             let (time_low, time_mid, time_hi_and_version, clock_seq_and_node) = u.as_fields();
@@ -660,7 +674,7 @@ fn parse_uuid(s: &str) -> Result<raw::TEEC_UUID, String> {
 /// # Returns
 /// `Ok(())` if `rc == TEEC_SUCCESS`, otherwise `Err` with the hex error
 /// code and origin for debugging.
-fn check_teec_rc(rc: u32, origin: u32) -> Result<(), String> {
+pub(crate) fn check_teec_rc(rc: u32, origin: u32) -> Result<(), String> {
     if rc != raw::TEEC_SUCCESS {
         Err(format!("TEEC_InvokeCommand failed: 0x{rc:08x}, origin={origin}"))
     } else {
@@ -704,7 +718,7 @@ fn parse_arg_str(args: &[String], flag: &str) -> Result<String, String> {
 }
 
 /// Extract a u32 argument value following a flag (e.g. `--slot 0` → 0u32).
-fn parse_arg_u32(args: &[String], flag: &str) -> Result<u32, String> {
+pub(crate) fn parse_arg_u32(args: &[String], flag: &str) -> Result<u32, String> {
     let s = parse_arg_str(args, flag)?;
     s.parse::<u32>().map_err(|e| format!("{flag} parse error: {e}"))
 }
