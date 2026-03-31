@@ -52,6 +52,7 @@ const BIZ_SUCCESS:           u32 = 0x900D;
 const BIZ_RELAY_START:       u32 = 0x9001;
 const BIZ_RELAY_CONTINUE:    u32 = 0x9002;
 const BIZ_RELAY_DONE:        u32 = 0x9003;
+const BIZ_RELAY_STREAMING:   u32 = 0x9004;
 const BIZ_ERR_BAD_JSON:      u32 = 0xE001;
 const BIZ_ERR_KEY_NOT_FOUND: u32 = 0xE004;
 const BIZ_ERR_FORBIDDEN:     u32 = 0xE005;
@@ -297,6 +298,7 @@ fn cmd_proxy(session: &mut raw::TEEC_Session, args: &[String]) -> Result<(), Str
     let url = parse_arg_str(args, "--url")?;
     let body_str = parse_arg_str(args, "--body")?;
     let method_str = parse_arg_str(args, "--method").unwrap_or_else(|_| "Post".into());
+    let stream_mode = args.iter().any(|a| a == "--stream");
 
     let method = match method_str.as_str() {
         "Get"    => HttpMethod::Get,
@@ -354,7 +356,7 @@ fn cmd_proxy(session: &mut raw::TEEC_Session, args: &[String]) -> Result<(), Str
 
         eprintln!("secret_proxy_ca: relay mode → TCP connect to {target}");
 
-        return relay_loop(session, &target, initial_tls);
+        return relay_loop(session, &target, initial_tls, stream_mode);
     }
 
     // --- Legacy mode: TA returned the final result directly ---
@@ -382,6 +384,7 @@ fn relay_loop(
     session: &mut raw::TEEC_Session,
     target: &str,
     initial_tls: &[u8],
+    stream_mode: bool,
 ) -> Result<(), String> {
     // 1. TCP connect to the target API server
     let mut tcp = TcpStream::connect(target)
@@ -457,11 +460,32 @@ fn relay_loop(
                     eprintln!("secret_proxy_ca: relay round {round}, →server {filled} bytes");
                 }
             }
+            BIZ_RELAY_STREAMING => {
+                // Streaming mode: write decrypted plaintext to stdout immediately
+                if filled > 0 && stream_mode {
+                    std::io::stdout().write_all(&response_buf[..filled])
+                        .map_err(|e| format!("stdout write: {e}"))?;
+                    std::io::stdout().flush()
+                        .map_err(|e| format!("stdout flush: {e}"))?;
+                }
+
+                // Send any TLS bytes back to server
+                let tls_len = unsafe { op.params[3].tmpref.size };
+                if tls_len > 0 {
+                    tcp.write_all(&tls_final_buf[..tls_len])
+                        .map_err(|e| format!("TCP write TLS data: {e}"))?;
+                }
+            }
             BIZ_RELAY_DONE => {
                 // Send any final TLS bytes (e.g. close_notify) before closing
                 let final_tls_len = unsafe { op.params[3].tmpref.size };
                 if final_tls_len > 0 {
                     let _ = tcp.write_all(&tls_final_buf[..final_tls_len]);
+                }
+
+                if stream_mode {
+                    // Streaming: all data already written to stdout
+                    return Ok(());
                 }
 
                 let http_status = detail;
@@ -545,7 +569,7 @@ fn print_usage(prog: &str) {
     eprintln!("  {prog} remove-key --slot <N>");
     eprintln!("  {prog} add-whitelist --pattern <url-prefix>");
     eprintln!("  {prog} proxy --slot <N> --url <https://...> --body <json>");
-    eprintln!("             [--method Post|Get|Put|Delete|Patch]");
+    eprintln!("             [--method Post|Get|Put|Delete|Patch] [--stream]");
     eprintln!();
     eprintln!("The proxy command uses TEEC relay mode: the CA handles TCP I/O to");
     eprintln!("external APIs while the TA drives TLS encryption inside the TEE.");
