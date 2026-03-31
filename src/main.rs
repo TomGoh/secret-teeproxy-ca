@@ -27,15 +27,13 @@ use cc_teec::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-// ---------------------------------------------------------------------------
-// TA identity — must match secret_proxy_ta's TA_UUID
-// ---------------------------------------------------------------------------
-
+/// TA UUID — must match `TA_UUID` in `secret_proxy_ta/src/main.rs`.
+/// The `teec_cc_bridge` uses this to locate the TA's Unix socket at
+/// `/tmp/{uuid}.sock`.
 const TA_UUID: &str = "a3f79c15-72d0-4e3a-b8d1-9f2ca3e81054";
 
-// ---------------------------------------------------------------------------
-// GP TEE command IDs — must match secret_proxy_ta's constants
-// ---------------------------------------------------------------------------
+/// GP TEE command IDs — must match the constants in `secret_proxy_ta/src/main.rs`.
+/// These are passed as `cmd_id` to `TEEC_InvokeCommand()`.
 
 const CMD_PROXY_REQUEST:  u32 = 0x0001;
 const CMD_PROVISION_KEY:  u32 = 0x0002;
@@ -44,9 +42,8 @@ const CMD_LIST_SLOTS:     u32 = 0x0004;
 const CMD_ADD_WHITELIST:  u32 = 0x0005;
 const CMD_RELAY_DATA:     u32 = 0x0006;
 
-// ---------------------------------------------------------------------------
-// Business result codes — must match secret_proxy_ta's constants
-// ---------------------------------------------------------------------------
+/// Business result codes returned in `params[1].value.a` by the TA.
+/// Must match the constants in `secret_proxy_ta/src/main.rs`.
 
 const BIZ_SUCCESS:           u32 = 0x900D;
 const BIZ_RELAY_START:       u32 = 0x9001;
@@ -59,9 +56,12 @@ const BIZ_ERR_FORBIDDEN:     u32 = 0xE005;
 const BIZ_ERR_TRANSPORT:     u32 = 0xE006;
 
 // ---------------------------------------------------------------------------
-// Shared data types (must match protocol.rs in secret_proxy_ta)
+// Shared data types — must match protocol.rs in secret_proxy_ta.
+// These structs are serialized to/from JSON and passed as MemrefInput/Output
+// in TEEC parameters.
 // ---------------------------------------------------------------------------
 
+/// HTTP method enum — serialized as JSON variant name ("Get", "Post", etc.).
 #[derive(Debug, Serialize, Deserialize)]
 #[allow(dead_code)]
 enum HttpMethod {
@@ -72,31 +72,60 @@ enum HttpMethod {
     Patch,
 }
 
+/// Request payload sent to the TA via CMD_PROXY_REQUEST (params[0] MemrefInput).
+///
+/// The TA uses `key_id` to look up the API key in its key store and injects
+/// `Authorization: Bearer <key>` before encrypting with rustls.  The CA never
+/// sees the real API key.
+///
+/// `body` is a byte array (Vec<u8>) because JSON serializes it as an integer
+/// array — this avoids encoding issues with non-UTF-8 data.
 #[derive(Debug, Serialize, Deserialize)]
 struct ProxyRequest {
+    /// Key slot index — the TA looks up the API key by this ID.
     key_id: u32,
+    /// Target HTTPS URL (e.g. "https://api.minimax.chat/v1/text/chatcompletion_v2").
     endpoint_url: String,
+    /// HTTP method (Get, Post, Put, Delete, Patch).
     method: HttpMethod,
+    /// HTTP headers to include.  Do NOT include Authorization (TA injects it)
+    /// or Content-Length (TA adds it automatically).
     headers: HashMap<String, String>,
+    /// Request body as raw bytes.  For JSON APIs, this is the UTF-8 encoded
+    /// JSON string (e.g. `{"model":"MiniMax-Text-01","messages":[...]}`).
     body: Vec<u8>,
 }
 
+/// Response payload returned by the TA via BIZ_RELAY_DONE (params[2] MemrefOutput).
+///
+/// Only used in non-streaming mode.  In streaming mode, decrypted plaintext
+/// is returned progressively via BIZ_RELAY_STREAMING and this struct is not used.
 #[derive(Debug, Serialize, Deserialize)]
 struct ProxyResponse {
+    /// HTTP status code (e.g. 200, 401, 502).
     status: u16,
+    /// Response headers with lowercase keys (e.g. "content-type" → "application/json").
     headers: HashMap<String, String>,
+    /// Response body as raw bytes.
     body: Vec<u8>,
 }
 
+/// Payload for CMD_PROVISION_KEY (params[0] MemrefInput).
 #[derive(Debug, Serialize, Deserialize)]
 struct ProvisionKeyPayload {
+    /// Key slot index to store the key in.
     slot: u32,
+    /// The API key string (e.g. "sk-api--xxxxx").
     key: String,
+    /// Provider name (e.g. "minimax", "moonshot").
     provider: String,
 }
 
+/// Payload for CMD_ADD_WHITELIST (params[0] MemrefInput).
 #[derive(Debug, Serialize, Deserialize)]
 struct AddWhitelistPayload {
+    /// URL prefix pattern (e.g. "https://api.minimax.chat/").
+    /// The TA checks `endpoint_url.starts_with(pattern)` before allowing requests.
     pattern: String,
 }
 
@@ -111,6 +140,22 @@ fn main() {
     }
 }
 
+/// Main entry point: open a TEEC session to the TA, dispatch the CLI subcommand,
+/// and clean up.
+///
+/// # Logic
+/// 1. Parse the UUID string into `TEEC_UUID`.
+/// 2. `TEEC_InitializeContext` — connects to the TEE transport layer (virga).
+/// 3. `TEEC_OpenSession` — establishes a session with the TA identified by UUID.
+///    The `teec_cc_bridge` receives this via virga TLS + vsock:9999 and creates
+///    a Unix socket connection to `/tmp/{uuid}.sock`.
+/// 4. Dispatch the CLI subcommand (list-slots, provision-key, remove-key,
+///    add-whitelist, or proxy).
+/// 5. `TEEC_CloseSession` + `TEEC_FinalizeContext` — clean up regardless of
+///    subcommand success/failure.
+///
+/// # Returns
+/// `Ok(())` on success, `Err(String)` with human-readable error on failure.
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -163,10 +208,17 @@ fn run() -> Result<(), String> {
     result
 }
 
-// ---------------------------------------------------------------------------
-// list-slots
-// ---------------------------------------------------------------------------
-
+/// List all occupied key slot IDs in the TA via CMD_LIST_SLOTS (0x0004).
+///
+/// # TEEC Parameters
+/// - `params[0]` MemrefOutput: JSON array of slot IDs (e.g. `[0, 1, 7]`)
+/// - `params[1]` ValueOutput:  `{a: BIZ_SUCCESS, b: slot_count}`
+///
+/// # Logic
+/// 1. Allocate a 4KB output buffer for the JSON array.
+/// 2. `TEEC_InvokeCommand(CMD_LIST_SLOTS)`.
+/// 3. Read `params[1].value.b` for the count and `params[0]` for the JSON.
+/// 4. Deserialize and print: `Slots (N total): [0, 1, 7]`.
 fn cmd_list_slots(session: &mut raw::TEEC_Session) -> Result<(), String> {
     // params[0] MemrefOutput: JSON Vec<u32>
     // params[1] ValueOutput:  {a: biz_code, b: count}
@@ -196,10 +248,21 @@ fn cmd_list_slots(session: &mut raw::TEEC_Session) -> Result<(), String> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// provision-key --slot <N> --key <sk-...> --provider <name>
-// ---------------------------------------------------------------------------
-
+/// Store an API key in the TA's key slot via CMD_PROVISION_KEY (0x0002).
+///
+/// # CLI Arguments
+/// `--slot <N>` — slot index (u32), `--key <sk-...>` — API key string,
+/// `--provider <name>` — provider name (e.g. "minimax").
+///
+/// # TEEC Parameters
+/// - `params[0]` MemrefInput:  JSON `{"slot": N, "key": "sk-...", "provider": "minimax"}`
+/// - `params[1]` ValueOutput:  `{a: BIZ_SUCCESS, b: 0}`
+///
+/// # Logic
+/// 1. Parse `--slot`, `--key`, `--provider` from CLI args.
+/// 2. Serialize `ProvisionKeyPayload` to JSON.
+/// 3. `TEEC_InvokeCommand(CMD_PROVISION_KEY)` with JSON as MemrefInput.
+/// 4. Check TEEC return code and business code.
 fn cmd_provision_key(session: &mut raw::TEEC_Session, args: &[String]) -> Result<(), String> {
     let slot = parse_arg_u32(args, "--slot")?;
     let key = parse_arg_str(args, "--key")?;
@@ -229,10 +292,15 @@ fn cmd_provision_key(session: &mut raw::TEEC_Session, args: &[String]) -> Result
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// remove-key --slot <N>
-// ---------------------------------------------------------------------------
-
+/// Remove an API key from a slot via CMD_REMOVE_KEY (0x0003).
+///
+/// # CLI Arguments
+/// `--slot <N>` — slot index to remove.
+///
+/// # TEEC Parameters
+/// - `params[0]` ValueInput:   `{a: slot_id, b: 0}` (no JSON needed for a single u32)
+/// - `params[1]` ValueOutput:  `{a: BIZ_SUCCESS, b: 0}` or
+///                             `{a: BIZ_ERR_KEY_NOT_FOUND, b: slot_id}`
 fn cmd_remove_key(session: &mut raw::TEEC_Session, args: &[String]) -> Result<(), String> {
     let slot = parse_arg_u32(args, "--slot")?;
 
@@ -257,10 +325,17 @@ fn cmd_remove_key(session: &mut raw::TEEC_Session, args: &[String]) -> Result<()
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// add-whitelist --pattern <url-prefix>
-// ---------------------------------------------------------------------------
-
+/// Add a URL prefix pattern to the TA's whitelist via CMD_ADD_WHITELIST (0x0005).
+///
+/// # CLI Arguments
+/// `--pattern <url-prefix>` — URL prefix (e.g. "https://api.openai.com/").
+///
+/// # TEEC Parameters
+/// - `params[0]` MemrefInput:  JSON `{"pattern": "https://..."}`
+/// - `params[1]` ValueOutput:  `{a: BIZ_SUCCESS, b: 0}`
+///
+/// The TA uses prefix matching: a request to `endpoint_url` is allowed if
+/// `endpoint_url.starts_with(pattern)` for any whitelisted pattern.
 fn cmd_add_whitelist(session: &mut raw::TEEC_Session, args: &[String]) -> Result<(), String> {
     let pattern = parse_arg_str(args, "--pattern")?;
 
@@ -288,11 +363,25 @@ fn cmd_add_whitelist(session: &mut raw::TEEC_Session, args: &[String]) -> Result
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// proxy --slot <N> --url <https://...> --body <json-string>
-//        [--method Post|Get|Put|Delete|Patch]  (default: Post)
-// ---------------------------------------------------------------------------
-
+/// Execute an HTTP proxy request through the TEEC relay.
+///
+/// # Logic
+/// 1. Parse CLI arguments: `--slot`, `--url`, `--body`, `--method`, `--stream`.
+/// 2. Build a `ProxyRequest` JSON and send via `TEEC_InvokeCommand(CMD_PROXY_REQUEST)`.
+/// 3. Check the response:
+///    - `BIZ_RELAY_START`: TA created a relay session.  Extract the target
+///      "host:port" from `params[2]` and initial TLS bytes from `params[3]`.
+///      Enter [`relay_loop`] to drive the TCP + TEEC relay cycle.
+///    - `BIZ_SUCCESS`: legacy mode (vsock-forwarder/direct-http).  The TA
+///      returned the full ProxyResponse directly in `params[2]`.
+///    - `BIZ_ERR_*`: validation failure (whitelist, key not found, bad JSON).
+///
+/// # Arguments
+/// * `session` - open TEEC session to the TA
+/// * `args` - CLI argument slice after the "proxy" subcommand
+///
+/// # Returns
+/// `Ok(())` on success (response printed to stdout), `Err(String)` on failure.
 fn cmd_proxy(session: &mut raw::TEEC_Session, args: &[String]) -> Result<(), String> {
     let slot = parse_arg_u32(args, "--slot")?;
     let url = parse_arg_str(args, "--url")?;
@@ -376,10 +465,38 @@ fn cmd_proxy(session: &mut raw::TEEC_Session, args: &[String]) -> Result<(), Str
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Relay loop: CA drives TCP I/O, TA drives TLS state machine
-// ---------------------------------------------------------------------------
-
+/// Relay loop: the CA drives TCP I/O while the TA drives the TLS state machine.
+///
+/// # Logic
+/// 1. `TcpStream::connect(target)` to the API server (e.g. api.minimax.chat:443).
+///    Set a 30-second read timeout.
+/// 2. Send initial TLS bytes (ClientHello from CMD_PROXY_REQUEST) to the server.
+/// 3. Enter the relay loop.  Each iteration:
+///    a. Read ciphertext from the TCP socket (server → CA).
+///    b. Send it to the TA via `TEEC_InvokeCommand(CMD_RELAY_DATA)`.
+///    c. Process the TA's response based on the business status code:
+///       - `BIZ_RELAY_CONTINUE`: send `params[2]` TLS bytes to the server.
+///         (TLS handshake continuation or encrypted HTTP request.)
+///       - `BIZ_RELAY_STREAMING`: TA has decrypted SSE plaintext.  If
+///         `stream_mode`, write `params[2]` to stdout and flush immediately.
+///         Send any `params[3]` TLS bytes to the server.
+///       - `BIZ_RELAY_DONE`: relay complete.  In `stream_mode`, all data was
+///         already written to stdout — just send final TLS bytes and return.
+///         In non-stream mode, parse `params[2]` as ProxyResponse JSON and
+///         print as `HTTP {status}\n{body}`.
+///       - `BIZ_ERR_TRANSPORT`: TA reported a TLS/connection error.
+/// 4. EOF detection: if `tcp.read()` returns 0 twice consecutively, the server
+///    closed the connection before the TA completed — return an error to
+///    prevent infinite looping.
+///
+/// # Arguments
+/// * `session` - open TEEC session to the TA
+/// * `target` - "host:port" string from CMD_PROXY_REQUEST response
+/// * `initial_tls` - ClientHello bytes from CMD_PROXY_REQUEST response
+/// * `stream_mode` - if true, write decrypted plaintext to stdout progressively
+///
+/// # Returns
+/// `Ok(())` on success, `Err(String)` on TCP/TEEC failure.
 fn relay_loop(
     session: &mut raw::TEEC_Session,
     target: &str,
@@ -510,10 +627,15 @@ fn relay_loop(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
+/// Parse a UUID string (e.g. "a3f79c15-72d0-4e3a-b8d1-9f2ca3e81054") into the
+/// `TEEC_UUID` struct required by rust-libteec.
+///
+/// # Arguments
+/// * `s` - UUID string in standard 8-4-4-4-12 format
+///
+/// # Returns
+/// `Ok(TEEC_UUID)` on success.  The struct fields (timeLow, timeMid, etc.)
+/// are populated from the UUID's binary representation.
 fn parse_uuid(s: &str) -> Result<raw::TEEC_UUID, String> {
     Uuid::parse_str(s)
         .map(|u| {
@@ -528,6 +650,16 @@ fn parse_uuid(s: &str) -> Result<raw::TEEC_UUID, String> {
         .map_err(|e| format!("UUID parse failed: {e}"))
 }
 
+/// Check the TEEC return code from `TEEC_InvokeCommand`.
+///
+/// # Arguments
+/// * `rc` - return code from the TEEC call (0 = `TEEC_SUCCESS`)
+/// * `origin` - error origin indicator (which layer produced the error:
+///   TEE client API, communication, trusted app, or trusted OS)
+///
+/// # Returns
+/// `Ok(())` if `rc == TEEC_SUCCESS`, otherwise `Err` with the hex error
+/// code and origin for debugging.
 fn check_teec_rc(rc: u32, origin: u32) -> Result<(), String> {
     if rc != raw::TEEC_SUCCESS {
         Err(format!("TEEC_InvokeCommand failed: 0x{rc:08x}, origin={origin}"))
@@ -536,6 +668,18 @@ fn check_teec_rc(rc: u32, origin: u32) -> Result<(), String> {
     }
 }
 
+/// Check the TA business result code from `params[1].value.a`.
+///
+/// The TA always returns `TEE_SUCCESS` at the TEEC level; business-layer
+/// errors are communicated via this code.
+///
+/// # Arguments
+/// * `biz_code` - value from `params[1].value.a` in the TA's response
+///
+/// # Returns
+/// `Ok(())` if `biz_code == BIZ_SUCCESS (0x900D)`.  Otherwise, returns
+/// `Err` with a human-readable message mapping the code to its meaning
+/// (e.g. 0xE005 → "endpoint blocked by whitelist").
 fn check_biz_code(biz_code: u32) -> Result<(), String> {
     if biz_code == BIZ_SUCCESS {
         return Ok(());
@@ -550,6 +694,8 @@ fn check_biz_code(biz_code: u32) -> Result<(), String> {
     Err(format!("TA error 0x{biz_code:04x}: {msg}"))
 }
 
+/// Extract a string argument value following a flag (e.g. `--slot 0` → "0").
+/// Scans `args` for a window `[flag, value]` and returns the value.
 fn parse_arg_str(args: &[String], flag: &str) -> Result<String, String> {
     args.windows(2)
         .find(|w| w[0] == flag)
@@ -557,6 +703,7 @@ fn parse_arg_str(args: &[String], flag: &str) -> Result<String, String> {
         .ok_or_else(|| format!("missing argument: {flag}"))
 }
 
+/// Extract a u32 argument value following a flag (e.g. `--slot 0` → 0u32).
 fn parse_arg_u32(args: &[String], flag: &str) -> Result<u32, String> {
     let s = parse_arg_str(args, flag)?;
     s.parse::<u32>().map_err(|e| format!("{flag} parse error: {e}"))
