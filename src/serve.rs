@@ -205,16 +205,28 @@ fn handle_http_connection(
         req_headers.insert("Content-Type".into(), "application/json".into());
     }
 
+    // Encode body as base64 to reduce TEEC payload size.
+    // 61KB raw → 82KB base64 (vs 220KB as JSON integer array).
+    use base64::Engine;
+    let body_b64 = base64::engine::general_purpose::STANDARD.encode(&incoming.body);
+    eprintln!(
+        "secret_proxy_ca: body encoding: {} raw → {} base64 (was {} as int array)",
+        incoming.body.len(), body_b64.len(),
+        incoming.body.len() * 4  // approximate JSON int array size
+    );
+
     let req = ProxyRequest {
         key_id: incoming.key_id,
         endpoint_url: incoming.endpoint_url,
         method,
         headers: req_headers,
-        body: incoming.body,
+        body: Vec::new(),          // empty — TA will use body_base64
+        body_base64: Some(body_b64),
     };
 
     let mut json = serde_json::to_vec(&req)
         .map_err(|e| format!("serialize ProxyRequest: {e}"))?;
+    eprintln!("secret_proxy_ca: ProxyRequest JSON size: {} bytes", json.len());
 
     // CMD_PROXY_REQUEST
     let mut target_buf = vec![0u8; 1024];

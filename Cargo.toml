@@ -9,3 +9,4 @@ cc_teec = { package = "rust-libteec", git = "https://gitee.com/jose47/rust-libte
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = "1"
+base64 = "0.22"

@@ -94,9 +94,15 @@ pub(crate) struct ProxyRequest {
     /// HTTP headers to include.  Do NOT include Authorization (TA injects it)
     /// or Content-Length (TA adds it automatically).
     headers: HashMap<String, String>,
-    /// Request body as raw bytes.  For JSON APIs, this is the UTF-8 encoded
-    /// JSON string (e.g. `{"model":"MiniMax-Text-01","messages":[...]}`).
+    /// Request body as raw bytes (JSON integer array).
+    /// Used by CLI mode.
+    #[serde(default)]
     body: Vec<u8>,
+    /// Request body as base64-encoded string (compact alternative).
+    /// Used by serve mode for large payloads to reduce TEEC transport overhead.
+    /// If both `body` and `body_base64` are present, TA prefers `body_base64`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    body_base64: Option<String>,
 }
 
 /// Response payload returned by the TA via BIZ_RELAY_DONE (params[2] MemrefOutput).
@@ -418,6 +424,7 @@ fn cmd_proxy(session: &mut raw::TEEC_Session, args: &[String]) -> Result<(), Str
         method,
         headers,
         body: body_str.into_bytes(),
+        body_base64: None,
     };
     let mut json = serde_json::to_vec(&req).map_err(|e| format!("serialize error: {e}"))?;
 
