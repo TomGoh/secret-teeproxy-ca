@@ -30,6 +30,7 @@ use cc_teec::{
     TEEC_CloseSession, TEEC_FinalizeContext, TEEC_InitializeContext, TEEC_InvokeCommand,
     TEEC_OpenSession, raw,
 };
+use log::{info, debug, warn, error};
 use serde::Deserialize;
 
 use crate::{
@@ -72,7 +73,7 @@ fn default_method() -> String {
 pub fn cmd_serve(args: &[String]) -> Result<(), String> {
     let port = parse_arg_u32(args, "--port").unwrap_or(18790);
 
-    eprintln!("secret_proxy_ca: serve mode starting on port {port}");
+    info!("serve mode starting on port {port}");
 
     // Initialize TEEC (persistent, reused across all requests)
     let ta_uuid = parse_uuid(TA_UUID)?;
@@ -99,23 +100,23 @@ pub fn cmd_serve(args: &[String]) -> Result<(), String> {
         return Err(format!("TEEC_OpenSession failed: 0x{rc:08x}, origin={origin}"));
     }
 
-    eprintln!("secret_proxy_ca: TEEC session established (persistent)");
+    info!("TEEC session established (persistent)");
 
     // Bind HTTP server
     let listener = TcpListener::bind(format!("0.0.0.0:{port}"))
         .map_err(|e| format!("TCP bind failed: {e}"))?;
 
-    eprintln!("secret_proxy_ca: HTTP server listening on http://0.0.0.0:{port}");
-    eprintln!("secret_proxy_ca: accepts POST with SecretProxyRequest JSON, returns SSE");
+    info!("HTTP server listening on http://0.0.0.0:{port}");
+    info!("accepts POST with SecretProxyRequest JSON, returns SSE");
 
     for stream in listener.incoming() {
         match stream {
             Ok(client) => {
                 if let Err(e) = handle_http_connection(&mut session, client) {
-                    eprintln!("secret_proxy_ca: serve error: {e}");
+                    error!("serve error: {e}");
                 }
             }
-            Err(e) => eprintln!("secret_proxy_ca: accept error: {e}"),
+            Err(e) => error!("accept error: {e}"),
         }
     }
 
@@ -187,10 +188,43 @@ fn handle_http_connection(
         }
     };
 
-    eprintln!(
-        "secret_proxy_ca: serve → {} {} (key_id={}, body={} bytes)",
+    info!(
+        "serve → {} {} (key_id={}, body={} bytes)",
         incoming.method, incoming.endpoint_url, incoming.key_id, incoming.body.len()
     );
+
+    // Log the request body (the actual prompt being sent to the LLM)
+    if let Ok(body_str) = std::str::from_utf8(&incoming.body) {
+        if let Ok(body_json) = serde_json::from_str::<serde_json::Value>(body_str) {
+            if let Some(model) = body_json.get("model") {
+                info!("┌─ REQUEST ─────────────────────────────");
+                info!("│ model: {model}");
+            }
+            if let Some(messages) = body_json.get("messages").and_then(|m| m.as_array()) {
+                for msg in messages {
+                    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+                    // Content can be a string or an array of content blocks
+                    let content_text = if let Some(s) = msg.get("content").and_then(|c| c.as_str()) {
+                        s.to_string()
+                    } else if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
+                        // Anthropic format: [{"type":"text","text":"..."},{"type":"image",...}]
+                        arr.iter()
+                            .filter_map(|block| {
+                                block.get("text").and_then(|t| t.as_str())
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    } else {
+                        String::new()
+                    };
+                    let preview: String = content_text.chars().take(200).collect();
+                    let suffix = if content_text.chars().count() > 200 { "..." } else { "" };
+                    info!("│ [{role}] {preview}{suffix}");
+                }
+            }
+            info!("└───────────────────────────────────────");
+        }
+    }
 
     // 4. Build ProxyRequest and start TEEC relay.
     //    Ensure anthropic-version header is present — MiniMax's Anthropic endpoint
@@ -209,8 +243,8 @@ fn handle_http_connection(
     // 61KB raw → 82KB base64 (vs 220KB as JSON integer array).
     use base64::Engine;
     let body_b64 = base64::engine::general_purpose::STANDARD.encode(&incoming.body);
-    eprintln!(
-        "secret_proxy_ca: body encoding: {} raw → {} base64 (was {} as int array)",
+    debug!(
+        "body encoding: {} raw → {} base64 (was ~{} as int array)",
         incoming.body.len(), body_b64.len(),
         incoming.body.len() * 4  // approximate JSON int array size
     );
@@ -226,7 +260,7 @@ fn handle_http_connection(
 
     let mut json = serde_json::to_vec(&req)
         .map_err(|e| format!("serialize ProxyRequest: {e}"))?;
-    eprintln!("secret_proxy_ca: ProxyRequest JSON size: {} bytes", json.len());
+    debug!("ProxyRequest JSON size: {} bytes", json.len());
 
     // CMD_PROXY_REQUEST
     let mut target_buf = vec![0u8; 1024];
@@ -265,7 +299,7 @@ fn handle_http_connection(
     let tls_len = unsafe { op.params[3].tmpref.size };
     let initial_tls = &tls_buf[..tls_len];
 
-    eprintln!("secret_proxy_ca: serve relay → {target}");
+    info!("serve relay → {target}");
 
     // 5. Run relay loop, streaming SSE to client
     relay_and_stream(session, target, initial_tls, &mut client)
@@ -293,10 +327,10 @@ fn relay_and_stream(
     // TCP connect to LLM API server
     let mut tcp = TcpStream::connect(target)
         .map_err(|e| format!("TCP connect to {target}: {e}"))?;
-    tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)))
+    tcp.set_read_timeout(Some(std::time::Duration::from_secs(120)))
         .map_err(|e| format!("set_read_timeout: {e}"))?;
 
-    eprintln!("serve-relay: sending {} bytes ClientHello to {target}", initial_tls.len());
+    debug!("sending {} bytes ClientHello to {target}", initial_tls.len());
     tcp.write_all(initial_tls)
         .map_err(|e| format!("TCP write ClientHello: {e}"))?;
 
@@ -306,10 +340,14 @@ fn relay_and_stream(
     let mut saw_eof = false;
     let mut response_started = false;
     let mut round = 0u32;
+    // Track whether upstream uses chunked encoding (detected from response headers)
+    let mut is_chunked = false;
+    // Chunked decoder state: bytes remaining in current chunk (carried across relay rounds)
+    let mut chunk_remaining: usize = 0;
 
     loop {
         round += 1;
-        eprintln!("serve-relay: round {round}, reading from TCP...");
+        debug!("relay round {round}, reading from TCP...");
         let n = match tcp.read(&mut read_buf) {
             Ok(n) => n,
             Err(ref e)
@@ -336,7 +374,7 @@ fn relay_and_stream(
             saw_eof = false;
         }
 
-        eprintln!("serve-relay: round {round}, server→ {n} bytes{}", if n == 0 { " (EOF)" } else { "" });
+        debug!("relay round {round}, server→ {n} bytes{}", if n == 0 { " (EOF)" } else { "" });
 
         // Send ciphertext to TA via CMD_RELAY_DATA
         let mut server_data = read_buf[..n].to_vec();
@@ -367,13 +405,13 @@ fn relay_and_stream(
         let filled = unsafe { op.params[2].tmpref.size };
         let tls_extra_filled = unsafe { op.params[3].tmpref.size };
 
-        eprintln!("serve-relay: round {round}, TA status=0x{status:04x}, params[2]={filled} bytes, params[3]={tls_extra_filled} bytes");
+        debug!("relay round {round}, TA status=0x{status:04x}, params[2]={filled} bytes, params[3]={tls_extra_filled} bytes");
 
         match status {
             BIZ_RELAY_CONTINUE => {
                 if filled > 0 {
                     // TLS handshake — send outgoing bytes to server
-                    eprintln!("serve-relay: round {round}, →server {filled} bytes (handshake)");
+                    debug!("relay round {round}, →server {filled} bytes (handshake)");
                     tcp.write_all(&response_buf[..filled])
                         .map_err(|e| format!("TCP write TLS: {e}"))?;
                 } else {
@@ -381,7 +419,7 @@ fn relay_and_stream(
                     // Pump the state machine with empty input — rustls may
                     // have pending write_tls data after processing multiple
                     // TLS records across separate process_relay calls.
-                    eprintln!("serve-relay: round {round}, pumping TA (0 outgoing, calling relay with empty)");
+                    debug!("relay round {round}, pumping TA (0 outgoing, calling relay with empty)");
                     let mut empty = Vec::new();
                     let mut op2: raw::TEEC_Operation = unsafe { mem::zeroed() };
                     op2.paramTypes = raw::TEEC_PARAM_TYPES(
@@ -405,7 +443,7 @@ fn relay_and_stream(
                     }
                     let pump_filled = unsafe { op2.params[2].tmpref.size };
                     if pump_filled > 0 {
-                        eprintln!("serve-relay: round {round}, pump produced {pump_filled} bytes, →server");
+                        debug!("relay round {round}, pump produced {pump_filled} bytes, →server");
                         tcp.write_all(&response_buf[..pump_filled])
                             .map_err(|e| format!("TCP write TLS (pump): {e}"))?;
                     }
@@ -419,6 +457,22 @@ fn relay_and_stream(
                     // First streaming chunk: contains HTTP headers + initial body.
                     // Extract the LLM server's HTTP status and start our response.
                     let (http_status, body_start) = parse_upstream_headers(decrypted);
+
+                    // Detect chunked transfer encoding from upstream headers
+                    let header_bytes = &decrypted[..body_start.saturating_sub(4).min(decrypted.len())];
+                    if let Ok(hdr) = std::str::from_utf8(header_bytes) {
+                        info!("┌─ UPSTREAM RESPONSE ────────────────────");
+                        for line in hdr.lines().take(10) {
+                            info!("│ {line}");
+                            if line.to_lowercase().contains("transfer-encoding")
+                                && line.to_lowercase().contains("chunked")
+                            {
+                                is_chunked = true;
+                            }
+                        }
+                        info!("└───────────────────────────────────────");
+                    }
+                    debug!("upstream chunked encoding: {is_chunked}");
 
                     // Write HTTP response headers to OpenClaw client
                     let response_headers = format!(
@@ -436,15 +490,25 @@ fn relay_and_stream(
                     // Write initial body data (SSE events after the upstream headers)
                     if body_start < decrypted.len() {
                         let body_data = &decrypted[body_start..];
-                        let dechunked = strip_chunked_framing(body_data);
-                        client.write_all(&dechunked)
+                        let output = if is_chunked {
+                            strip_chunked_framing(body_data, &mut chunk_remaining)
+                        } else {
+                            body_data.to_vec()
+                        };
+                        log_sse_content(&output);
+                        client.write_all(&output)
                             .map_err(|e| format!("client write initial body: {e}"))?;
                         client.flush().map_err(|e| format!("client flush: {e}"))?;
                     }
                 } else {
                     // Subsequent chunks: just SSE body data
-                    let dechunked = strip_chunked_framing(decrypted);
-                    client.write_all(&dechunked)
+                    let output = if is_chunked {
+                        strip_chunked_framing(decrypted, &mut chunk_remaining)
+                    } else {
+                        decrypted.to_vec()
+                    };
+                    log_sse_content(&output);
+                    client.write_all(&output)
                         .map_err(|e| format!("client write SSE: {e}"))?;
                     client.flush().map_err(|e| format!("client flush: {e}"))?;
                 }
@@ -484,7 +548,7 @@ fn relay_and_stream(
                 }
 
                 let _ = client.flush();
-                eprintln!("secret_proxy_ca: serve → stream complete");
+                info!("serve → stream complete");
                 return Ok(());
             }
 
@@ -495,6 +559,72 @@ fn relay_and_stream(
                 }
                 return Err(msg);
             }
+        }
+    }
+}
+
+/// Log SSE event content, extracting the actual text from Anthropic-format events.
+///
+/// Parses `data: {...}` lines and prints the text deltas and thinking content
+/// so the operator can see the LLM's real words in the log.
+fn log_sse_content(data: &[u8]) {
+    let Ok(text) = std::str::from_utf8(data) else { return };
+    for line in text.lines() {
+        if !line.starts_with("data: ") {
+            continue;
+        }
+        let json_str = &line["data: ".len()..];
+        if json_str == "[DONE]" {
+            info!("◄ [DONE]");
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(json_str) else { continue };
+        let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        match event_type {
+            "content_block_delta" => {
+                if let Some(delta) = event.get("delta") {
+                    let delta_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    match delta_type {
+                        "text_delta" => {
+                            if let Some(t) = delta.get("text").and_then(|t| t.as_str()) {
+                                eprint!("{t}");
+                            }
+                        }
+                        "thinking_delta" => {
+                            if let Some(t) = delta.get("thinking").and_then(|t| t.as_str()) {
+                                eprint!("{t}");
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "content_block_start" => {
+                if let Some(cb) = event.get("content_block") {
+                    let cb_type = cb.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    match cb_type {
+                        "thinking" => info!("\n◄ [thinking]"),
+                        "text" => info!("\n◄ [text]"),
+                        _ => info!("\n◄ [block:{cb_type}]"),
+                    }
+                }
+            }
+            "message_start" => {
+                if let Some(msg) = event.get("message") {
+                    let model = msg.get("model").and_then(|m| m.as_str()).unwrap_or("?");
+                    let id = msg.get("id").and_then(|i| i.as_str()).unwrap_or("?");
+                    info!("◄ message_start (model={model}, id={id})");
+                }
+            }
+            "message_delta" => {
+                if let Some(usage) = event.get("usage") {
+                    info!("\n◄ message_delta (usage: {usage})");
+                }
+            }
+            "message_stop" => {
+                info!("\n◄ message_stop");
+            }
+            _ => {}
         }
     }
 }
@@ -537,53 +667,99 @@ fn parse_upstream_headers(data: &[u8]) -> (u16, usize) {
     (status, body_start)
 }
 
-/// Strip `Transfer-Encoding: chunked` framing from raw bytes.
+/// Decode `Transfer-Encoding: chunked` framing from raw bytes.
 ///
-/// The LLM server uses chunked encoding.  The decrypted bytes from the TA
-/// contain raw chunked data in the format:
-/// ```text
-/// hex_size\r\n
-/// ...chunk data...\r\n
-/// hex_size\r\n
-/// ...chunk data...\r\n
-/// 0\r\n
-/// \r\n
-/// ```
+/// Uses a proper stateful chunked decoder that tracks expected chunk sizes,
+/// instead of the old heuristic that stripped any all-hex line.  The old
+/// approach would corrupt data when SSE content contained lines with only
+/// hex characters (e.g. code snippets like "abcdef", "face", "0000").
 ///
-/// This function removes the hex size lines and the trailing `0\r\n\r\n`
-/// terminator, returning only the concatenated chunk data.
+/// `chunk_remaining` tracks how many bytes of chunk data are still expected
+/// from a previous call (data may be split across relay rounds).
 ///
-/// Lines that are purely hex digits followed by `\r\n` are treated as chunk
-/// size markers.  Everything else is chunk data to keep.
-fn strip_chunked_framing(data: &[u8]) -> Vec<u8> {
+/// If parsing fails at any point, returns the raw data unchanged as a safe
+/// fallback — better to pass through framing artifacts than to corrupt content.
+fn strip_chunked_framing(data: &[u8], chunk_remaining: &mut usize) -> Vec<u8> {
     let mut result = Vec::with_capacity(data.len());
     let mut pos = 0;
 
     while pos < data.len() {
-        // Find the next \r\n
-        let line_end = data[pos..]
-            .windows(2)
-            .position(|w| w == b"\r\n")
-            .map(|p| pos + p)
-            .unwrap_or(data.len());
+        if *chunk_remaining > 0 {
+            // We're in the middle of a chunk — consume up to chunk_remaining bytes
+            let available = data.len() - pos;
+            let to_copy = available.min(*chunk_remaining);
+            result.extend_from_slice(&data[pos..pos + to_copy]);
+            pos += to_copy;
+            *chunk_remaining -= to_copy;
+
+            // If we've consumed the full chunk, skip trailing \r\n
+            if *chunk_remaining == 0 && pos + 2 <= data.len() {
+                if &data[pos..pos + 2] == b"\r\n" {
+                    pos += 2;
+                }
+            }
+            continue;
+        }
+
+        // Expecting a chunk size line: hex digits followed by \r\n
+        let line_end = match data[pos..].windows(2).position(|w| w == b"\r\n") {
+            Some(p) => pos + p,
+            None => {
+                // No complete line — could be partial chunk size at buffer boundary.
+                // Return what we have; the rest will come in the next round.
+                break;
+            }
+        };
 
         let line = &data[pos..line_end];
 
-        // Check if this line is a hex chunk size (e.g. "19c", "0")
-        let is_chunk_size = !line.is_empty()
-            && line.iter().all(|&b| b.is_ascii_hexdigit());
+        // Parse hex chunk size (ignore chunk extensions after ';')
+        let hex_str = match std::str::from_utf8(line) {
+            Ok(s) => s.split(';').next().unwrap_or("").trim(),
+            Err(_) => {
+                // Not valid UTF-8 — not a chunk size line.  Fall back to raw passthrough.
+                warn!("chunked decode: non-UTF8 at pos {pos}, falling back to raw");
+                return data.to_vec();
+            }
+        };
 
-        if is_chunk_size {
-            // Skip the chunk size line + \r\n
-            pos = if line_end + 2 <= data.len() { line_end + 2 } else { data.len() };
+        if hex_str.is_empty() {
+            // Empty line between chunks — skip
+            pos = line_end + 2;
+            continue;
+        }
+
+        let chunk_size = match usize::from_str_radix(hex_str, 16) {
+            Ok(size) => size,
+            Err(_) => {
+                // Not a valid hex size — this data isn't actually chunked, or we've
+                // lost sync.  Return raw data as fallback.
+                debug!("chunked decode: invalid hex '{}' at pos {pos}, falling back to raw", hex_str);
+                return data.to_vec();
+            }
+        };
+
+        // Skip past the chunk size line + \r\n
+        pos = line_end + 2;
+
+        if chunk_size == 0 {
+            // Terminal chunk — skip optional trailers and final \r\n
+            break;
+        }
+
+        // Read chunk data
+        let available = data.len() - pos;
+        let to_copy = available.min(chunk_size);
+        result.extend_from_slice(&data[pos..pos + to_copy]);
+        pos += to_copy;
+
+        if to_copy < chunk_size {
+            // Chunk spans into the next relay round
+            *chunk_remaining = chunk_size - to_copy;
         } else {
-            // Keep this line + \r\n as data
-            result.extend_from_slice(line);
-            if line_end + 2 <= data.len() {
-                result.extend_from_slice(b"\r\n");
-                pos = line_end + 2;
-            } else {
-                pos = data.len();
+            // Full chunk consumed — skip trailing \r\n
+            if pos + 2 <= data.len() && &data[pos..pos + 2] == b"\r\n" {
+                pos += 2;
             }
         }
     }

@@ -27,6 +27,7 @@ use cc_teec::{
     TEEC_CloseSession, TEEC_FinalizeContext, TEEC_InitializeContext, TEEC_InvokeCommand,
     TEEC_OpenSession, raw,
 };
+use log::{info, debug, error};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -143,8 +144,12 @@ struct AddWhitelistPayload {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info"),
+    ).init();
+
     if let Err(e) = run() {
-        eprintln!("secret_proxy_ca: {e}");
+        error!("{e}");
         std::process::exit(1);
     }
 }
@@ -210,7 +215,7 @@ fn run() -> Result<(), String> {
         "add-whitelist"  => cmd_add_whitelist(&mut session, &args[2..]),
         "proxy"          => cmd_proxy(&mut session, &args[2..]),
         other => {
-            eprintln!("unknown command: {other}");
+            error!("unknown command: {other}");
             print_usage(&args[0]);
             Ok(())
         }
@@ -464,7 +469,7 @@ fn cmd_proxy(session: &mut raw::TEEC_Session, args: &[String]) -> Result<(), Str
         let tls_len = unsafe { op.params[3].tmpref.size };
         let initial_tls = &tls_buf[..tls_len];
 
-        eprintln!("secret_proxy_ca: relay mode → TCP connect to {target}");
+        info!("relay mode → TCP connect to {target}");
 
         return relay_loop(session, &target, initial_tls, stream_mode);
     }
@@ -564,7 +569,7 @@ fn relay_loop(
             saw_eof = false;
         }
 
-        eprintln!("secret_proxy_ca: relay round {round}, server→ {n} bytes{}", if n == 0 { " (EOF)" } else { "" });
+        debug!("relay round {round}, server→ {n} bytes{}", if n == 0 { " (EOF)" } else { "" });
 
         // Send server data to TA via CMD_RELAY_DATA
         let mut server_data = read_buf[..n].to_vec();
@@ -595,7 +600,7 @@ fn relay_loop(
                 if filled > 0 {
                     tcp.write_all(&response_buf[..filled])
                         .map_err(|e| format!("TCP write TLS data failed: {e}"))?;
-                    eprintln!("secret_proxy_ca: relay round {round}, →server {filled} bytes");
+                    debug!("relay round {round}, →server {filled} bytes");
                 }
             }
             BIZ_RELAY_STREAMING => {
@@ -742,4 +747,6 @@ fn print_usage(prog: &str) {
     eprintln!("The proxy command uses TEEC relay mode: the CA handles TCP I/O to");
     eprintln!("external APIs while the TA drives TLS encryption inside the TEE.");
     eprintln!("No separate tls_forwarder process is needed.");
+    eprintln!();
+    eprintln!("Logging: set RUST_LOG=debug for verbose relay details.");
 }

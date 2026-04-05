@@ -854,6 +854,8 @@ name = "secret_proxy_ca"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "env_logger",
+ "log",
  "rust-libteec",
  "serde",
  "serde_json",
