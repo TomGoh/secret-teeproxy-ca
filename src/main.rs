@@ -576,12 +576,14 @@ fn relay_loop(
         let mut op: raw::TEEC_Operation = unsafe { mem::zeroed() };
         op.paramTypes = raw::TEEC_PARAM_TYPES(
             raw::TEEC_MEMREF_TEMP_INPUT,
-            raw::TEEC_VALUE_OUTPUT,
+            raw::TEEC_VALUE_INOUT,
             raw::TEEC_MEMREF_TEMP_OUTPUT,
             raw::TEEC_MEMREF_TEMP_OUTPUT,
         );
         op.params[0].tmpref.buffer = server_data.as_mut_ptr() as *mut _;
         op.params[0].tmpref.size = server_data.len();
+        op.params[1].value.a = if n == 0 { 1 } else { 0 };
+        op.params[1].value.b = 0;
         op.params[2].tmpref.buffer = response_buf.as_mut_ptr() as *mut _;
         op.params[2].tmpref.size = response_buf.len();
         op.params[3].tmpref.buffer = tls_final_buf.as_mut_ptr() as *mut _;

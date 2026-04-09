@@ -344,6 +344,8 @@ fn relay_and_stream(
     let mut is_chunked = false;
     // Chunked decoder state: bytes remaining in current chunk (carried across relay rounds)
     let mut chunk_remaining: usize = 0;
+    // Buffer for incomplete chunked framing data across relay rounds.
+    let mut chunk_pending = Vec::<u8>::new();
 
     loop {
         round += 1;
@@ -381,12 +383,16 @@ fn relay_and_stream(
         let mut op: raw::TEEC_Operation = unsafe { mem::zeroed() };
         op.paramTypes = raw::TEEC_PARAM_TYPES(
             raw::TEEC_MEMREF_TEMP_INPUT,
-            raw::TEEC_VALUE_OUTPUT,
+            raw::TEEC_VALUE_INOUT,
             raw::TEEC_MEMREF_TEMP_OUTPUT,
             raw::TEEC_MEMREF_TEMP_OUTPUT,
         );
         op.params[0].tmpref.buffer = server_data.as_mut_ptr() as *mut _;
         op.params[0].tmpref.size = server_data.len();
+        // Param 1 input: a=1 only when upstream TCP read returned EOF (n==0).
+        // Distinguishes that from empty ciphertext used to pump rustls (see below).
+        op.params[1].value.a = if n == 0 { 1 } else { 0 };
+        op.params[1].value.b = 0;
         op.params[2].tmpref.buffer = response_buf.as_mut_ptr() as *mut _;
         op.params[2].tmpref.size = response_buf.len();
         op.params[3].tmpref.buffer = tls_extra_buf.as_mut_ptr() as *mut _;
@@ -424,12 +430,14 @@ fn relay_and_stream(
                     let mut op2: raw::TEEC_Operation = unsafe { mem::zeroed() };
                     op2.paramTypes = raw::TEEC_PARAM_TYPES(
                         raw::TEEC_MEMREF_TEMP_INPUT,
-                        raw::TEEC_VALUE_OUTPUT,
+                        raw::TEEC_VALUE_INOUT,
                         raw::TEEC_MEMREF_TEMP_OUTPUT,
                         raw::TEEC_MEMREF_TEMP_OUTPUT,
                     );
                     op2.params[0].tmpref.buffer = empty.as_mut_ptr() as *mut _;
                     op2.params[0].tmpref.size = 0;
+                    op2.params[1].value.a = 0;
+                    op2.params[1].value.b = 0;
                     op2.params[2].tmpref.buffer = response_buf.as_mut_ptr() as *mut _;
                     op2.params[2].tmpref.size = response_buf.len();
                     op2.params[3].tmpref.buffer = tls_extra_buf.as_mut_ptr() as *mut _;
@@ -491,7 +499,7 @@ fn relay_and_stream(
                     if body_start < decrypted.len() {
                         let body_data = &decrypted[body_start..];
                         let output = if is_chunked {
-                            strip_chunked_framing(body_data, &mut chunk_remaining)
+                            strip_chunked_framing(body_data, &mut chunk_remaining, &mut chunk_pending)
                         } else {
                             body_data.to_vec()
                         };
@@ -503,7 +511,7 @@ fn relay_and_stream(
                 } else {
                     // Subsequent chunks: just SSE body data
                     let output = if is_chunked {
-                        strip_chunked_framing(decrypted, &mut chunk_remaining)
+                        strip_chunked_framing(decrypted, &mut chunk_remaining, &mut chunk_pending)
                     } else {
                         decrypted.to_vec()
                     };
@@ -679,39 +687,52 @@ fn parse_upstream_headers(data: &[u8]) -> (u16, usize) {
 ///
 /// If parsing fails at any point, returns the raw data unchanged as a safe
 /// fallback — better to pass through framing artifacts than to corrupt content.
-fn strip_chunked_framing(data: &[u8], chunk_remaining: &mut usize) -> Vec<u8> {
-    let mut result = Vec::with_capacity(data.len());
+fn strip_chunked_framing(
+    data: &[u8],
+    chunk_remaining: &mut usize,
+    pending: &mut Vec<u8>,
+) -> Vec<u8> {
+    pending.extend_from_slice(data);
+
+    let mut result = Vec::with_capacity(pending.len());
     let mut pos = 0;
 
-    while pos < data.len() {
+    while pos < pending.len() {
         if *chunk_remaining > 0 {
             // We're in the middle of a chunk — consume up to chunk_remaining bytes
-            let available = data.len() - pos;
+            let available = pending.len() - pos;
             let to_copy = available.min(*chunk_remaining);
-            result.extend_from_slice(&data[pos..pos + to_copy]);
+            result.extend_from_slice(&pending[pos..pos + to_copy]);
             pos += to_copy;
             *chunk_remaining -= to_copy;
 
-            // If we've consumed the full chunk, skip trailing \r\n
-            if *chunk_remaining == 0 && pos + 2 <= data.len() {
-                if &data[pos..pos + 2] == b"\r\n" {
+            // If we've consumed the full chunk, we must have trailing \r\n.
+            // If not available yet, wait for more bytes in the next round.
+            if *chunk_remaining == 0 {
+                if pos + 2 > pending.len() {
+                    break;
+                }
+                if &pending[pos..pos + 2] == b"\r\n" {
                     pos += 2;
+                } else {
+                    debug!("chunked decode: missing chunk CRLF, falling back to raw");
+                    let raw = pending.split_off(0);
+                    return raw;
                 }
             }
             continue;
         }
 
         // Expecting a chunk size line: hex digits followed by \r\n
-        let line_end = match data[pos..].windows(2).position(|w| w == b"\r\n") {
+        let line_end = match pending[pos..].windows(2).position(|w| w == b"\r\n") {
             Some(p) => pos + p,
             None => {
-                // No complete line — could be partial chunk size at buffer boundary.
-                // Return what we have; the rest will come in the next round.
+                // No complete line — partial chunk-size line, keep in pending.
                 break;
             }
         };
 
-        let line = &data[pos..line_end];
+        let line = &pending[pos..line_end];
 
         // Parse hex chunk size (ignore chunk extensions after ';')
         let hex_str = match std::str::from_utf8(line) {
@@ -719,7 +740,8 @@ fn strip_chunked_framing(data: &[u8], chunk_remaining: &mut usize) -> Vec<u8> {
             Err(_) => {
                 // Not valid UTF-8 — not a chunk size line.  Fall back to raw passthrough.
                 warn!("chunked decode: non-UTF8 at pos {pos}, falling back to raw");
-                return data.to_vec();
+                let raw = pending.split_off(0);
+                return raw;
             }
         };
 
@@ -735,7 +757,8 @@ fn strip_chunked_framing(data: &[u8], chunk_remaining: &mut usize) -> Vec<u8> {
                 // Not a valid hex size — this data isn't actually chunked, or we've
                 // lost sync.  Return raw data as fallback.
                 debug!("chunked decode: invalid hex '{}' at pos {pos}, falling back to raw", hex_str);
-                return data.to_vec();
+                let raw = pending.split_off(0);
+                return raw;
             }
         };
 
@@ -744,13 +767,14 @@ fn strip_chunked_framing(data: &[u8], chunk_remaining: &mut usize) -> Vec<u8> {
 
         if chunk_size == 0 {
             // Terminal chunk — skip optional trailers and final \r\n
+            // Keep parser simple: stop consuming here; any trailers stay in pending.
             break;
         }
 
         // Read chunk data
-        let available = data.len() - pos;
+        let available = pending.len() - pos;
         let to_copy = available.min(chunk_size);
-        result.extend_from_slice(&data[pos..pos + to_copy]);
+        result.extend_from_slice(&pending[pos..pos + to_copy]);
         pos += to_copy;
 
         if to_copy < chunk_size {
@@ -758,12 +782,15 @@ fn strip_chunked_framing(data: &[u8], chunk_remaining: &mut usize) -> Vec<u8> {
             *chunk_remaining = chunk_size - to_copy;
         } else {
             // Full chunk consumed — skip trailing \r\n
-            if pos + 2 <= data.len() && &data[pos..pos + 2] == b"\r\n" {
+            if pos + 2 <= pending.len() && &pending[pos..pos + 2] == b"\r\n" {
                 pos += 2;
             }
         }
     }
 
+    if pos > 0 {
+        pending.drain(0..pos);
+    }
     result
 }
 
