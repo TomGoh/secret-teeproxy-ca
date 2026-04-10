@@ -182,6 +182,31 @@ fn run() -> Result<(), String> {
         return serve::cmd_serve(&args[2..]);
     }
 
+    // `dns-test` is a TEEC-free diagnostic: it just calls `to_socket_addrs`
+    // and prints the result. Used to verify the platform's DNS resolver
+    // (musl /etc/resolv.conf vs Bionic dnsproxyd) works for a target host
+    // before exercising the full proxy path. Safe to run on any device,
+    // including stock Android with no TEE backend.
+    if args[1] == "dns-test" {
+        use std::net::ToSocketAddrs;
+        let host = args.get(2)
+            .ok_or("dns-test requires <hostname>")?;
+        let target = format!("{host}:443");
+        match target.to_socket_addrs() {
+            Ok(iter) => {
+                let addrs: Vec<_> = iter.collect();
+                if addrs.is_empty() {
+                    println!("{host} -> (no addresses)");
+                } else {
+                    println!("{host} ->");
+                    for a in addrs { println!("  {a}"); }
+                }
+                return Ok(());
+            }
+            Err(e) => return Err(format!("resolve {host} failed: {e}")),
+        }
+    }
+
     let ta_uuid = parse_uuid(TA_UUID)?;
 
     // Open TEE session
@@ -745,10 +770,16 @@ fn print_usage(prog: &str) {
     eprintln!("  {prog} add-whitelist --pattern <url-prefix>");
     eprintln!("  {prog} proxy --slot <N> --url <https://...> --body <json>");
     eprintln!("             [--method Post|Get|Put|Delete|Patch] [--stream]");
+    eprintln!("  {prog} serve [--port 19030]");
+    eprintln!("  {prog} dns-test <hostname>");
     eprintln!();
     eprintln!("The proxy command uses TEEC relay mode: the CA handles TCP I/O to");
     eprintln!("external APIs while the TA drives TLS encryption inside the TEE.");
     eprintln!("No separate tls_forwarder process is needed.");
+    eprintln!();
+    eprintln!("dns-test is a TEEC-free diagnostic: resolves <hostname>:443 via the");
+    eprintln!("platform's getaddrinfo and prints the result. Use it on Android to");
+    eprintln!("verify Bionic/dnsproxyd works before exercising the full proxy.");
     eprintln!();
     eprintln!("Logging: set RUST_LOG=debug for verbose relay details.");
 }
