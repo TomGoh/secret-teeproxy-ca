@@ -792,7 +792,6 @@ dependencies = [
 [[package]]
 name = "rust-libteec"
 version = "0.1.0"
-source = "git+https://gitee.com/jose47/rust-libteec.git?branch=feat%2Fchunk-size-4096#9d98fe525de7e41cf4dc39b2fff7e461b70e6dc5"
 dependencies = [
  "bytemuck",
  "dashmap",
@@ -963,7 +962,6 @@ dependencies = [
 [[package]]
 name = "teec-api-types"
 version = "0.1.0"
-source = "git+https://gitee.com/jose47/rust-libteec.git?branch=feat%2Fchunk-size-4096#9d98fe525de7e41cf4dc39b2fff7e461b70e6dc5"
 
 [[package]]
 name = "thiserror"
@@ -1010,12 +1008,12 @@ dependencies = [
 [[package]]
 name = "virga"
 version = "0.1.0"
-source = "git+https://github.com/kylin-x-kernel/virga#903e912094054d83049a864f9fca4c4027a90069"
+source = "git+https://github.com/kylin-x-kernel/virga#a9fc8b7332363e2b48232fbc6833c259c3754857"
 dependencies = [
+ "crc32fast",
  "env_logger",
  "log",
  "vsock",
- "xtransport",
 ]
 
 [[package]]
@@ -1225,15 +1223,6 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
-
-[[package]]
-name = "xtransport"
-version = "0.1.0"
-source = "git+https://github.com/kylin-x-kernel/virga#903e912094054d83049a864f9fca4c4027a90069"
-dependencies = [
- "crc32fast",
- "log",
-]
 
 [[package]]
 name = "yasna"
