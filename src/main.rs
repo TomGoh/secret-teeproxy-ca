@@ -902,6 +902,7 @@ fn errno_hint(errno: i32) -> &'static str {
         libc::ENODEV       => "  (no vsock peer at this CID; the host VM is probably not running)",
         libc::ECONNREFUSED => "  (peer is there but nothing is listening on that port)",
         libc::ECONNRESET   => "  (peer exists and reset the connection; on VMADDR_CID_LOCAL this means kernel vsock loopback is working but no one is listening on that port — a GOOD signal about kernel support)",
+        libc::ETIMEDOUT    => "  (SYN dispatched to peer but no answer — peer vsock stack is probably up and CID is registered, but no socket is in LISTEN state on that port and the peer's vsock driver is not sending RSTs for unknown destinations; in our pipeline this is the expected error when the x-kernel VM is booted but no teec_cc_bridge is running inside it)",
         libc::EPERM        => "  (operation not permitted; check process uid/capabilities)",
         libc::ENETUNREACH  => "  (network unreachable; kernel vsock configuration may be incomplete)",
         _                  => "",
