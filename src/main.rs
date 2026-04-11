@@ -207,6 +207,39 @@ fn run() -> Result<(), String> {
         }
     }
 
+    // `vsock-test` is a TEEC-free diagnostic that isolates the AF_VSOCK
+    // socket + connect path from the rest of the CA pipeline (rust-libteec
+    // → virga → mbedtls TLS-over-vsock). Errors are raw errno values from
+    // the kernel, so failures are attributable to one of:
+    //
+    //   - EACCES         SELinux blocked socket(AF_VSOCK,...) or connect(2)
+    //   - EAFNOSUPPORT   kernel has no vsock support at all
+    //   - ENODEV         no host-side vsock peer at this CID (VM not running)
+    //   - ECONNREFUSED   host is there but nothing is listening on that port
+    //   - EPERM          uid/capability problem
+    //
+    // Use on Android device bring-up to answer "does vsock work on this
+    // device for my app uid, and can I reach the TEE VM at the expected
+    // CID?" in isolation, before stacking TEEC/mbedtls errors on top.
+    //
+    // Usage:  secret_proxy_ca vsock-test <cid> [port]
+    // Examples:
+    //   vsock-test 103 9999    # our design-time TEEC bridge target
+    //   vsock-test 2 9999      # VMADDR_CID_HOST (host side), sanity check
+    //   vsock-test 1 9999      # VMADDR_CID_LOCAL, loopback — tests kernel
+    //                          # vsock support without any real peer
+    if args[1] == "vsock-test" {
+        let cid: u32 = args.get(2)
+            .ok_or("vsock-test requires <cid> [port]")?
+            .parse()
+            .map_err(|e| format!("invalid cid: {e}"))?;
+        let port: u32 = match args.get(3) {
+            Some(s) => s.parse().map_err(|e| format!("invalid port: {e}"))?,
+            None => 9999,
+        };
+        return vsock_test(cid, port);
+    }
+
     let ta_uuid = parse_uuid(TA_UUID)?;
 
     // Open TEE session
@@ -772,6 +805,7 @@ fn print_usage(prog: &str) {
     eprintln!("             [--method Post|Get|Put|Delete|Patch] [--stream]");
     eprintln!("  {prog} serve [--port 19030]");
     eprintln!("  {prog} dns-test <hostname>");
+    eprintln!("  {prog} vsock-test <cid> [port]");
     eprintln!();
     eprintln!("The proxy command uses TEEC relay mode: the CA handles TCP I/O to");
     eprintln!("external APIs while the TA drives TLS encryption inside the TEE.");
@@ -781,5 +815,95 @@ fn print_usage(prog: &str) {
     eprintln!("platform's getaddrinfo and prints the result. Use it on Android to");
     eprintln!("verify Bionic/dnsproxyd works before exercising the full proxy.");
     eprintln!();
+    eprintln!("vsock-test is a TEEC-free diagnostic that exercises the raw vsock");
+    eprintln!("socket + connect path to a given (cid, port). Errors come back as");
+    eprintln!("raw errno values from the kernel — useful on Android bring-up to");
+    eprintln!("distinguish SELinux denials (EACCES) from missing VM peers (ENODEV)");
+    eprintln!("or missing kernel support (EAFNOSUPPORT). Default port is 9999.");
+    eprintln!();
     eprintln!("Logging: set RUST_LOG=debug for verbose relay details.");
+}
+
+/// Raw `sockaddr_vm` as defined in `<linux/vm_sockets.h>`.
+///
+/// Not re-exported by every `libc` version on every target, so we declare it
+/// locally to keep this diagnostic self-contained. The layout matches the
+/// kernel ABI exactly; do not reorder fields.
+#[repr(C)]
+#[derive(Default)]
+#[allow(non_camel_case_types)]
+struct SockaddrVm {
+    svm_family: libc::sa_family_t,
+    svm_reserved1: u16,
+    svm_port: u32,
+    svm_cid: u32,
+    svm_zero: [u8; 4],
+}
+
+/// TEEC-free diagnostic: attempt `socket(AF_VSOCK, SOCK_STREAM, 0)` +
+/// `connect(&sockaddr_vm { cid, port })` and print exactly what the kernel
+/// returned. See the call site in `run()` for the full intent.
+fn vsock_test(cid: u32, port: u32) -> Result<(), String> {
+    // Step 1: create the socket.
+    let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(format!(
+            "socket(AF_VSOCK, SOCK_STREAM, 0) failed: {e}{}",
+            errno_hint(e.raw_os_error().unwrap_or(0)),
+        ));
+    }
+    println!("✓ socket(AF_VSOCK, SOCK_STREAM, 0) → fd={fd}");
+
+    // Step 2: connect to (cid, port). On failure we still need to close the
+    // socket — capture the error first, close, then report.
+    let addr = SockaddrVm {
+        svm_family: libc::AF_VSOCK as libc::sa_family_t,
+        svm_port: port,
+        svm_cid: cid,
+        ..SockaddrVm::default()
+    };
+    let rc = unsafe {
+        libc::connect(
+            fd,
+            &addr as *const SockaddrVm as *const libc::sockaddr,
+            std::mem::size_of::<SockaddrVm>() as libc::socklen_t,
+        )
+    };
+    let connect_err = if rc < 0 {
+        Some(std::io::Error::last_os_error())
+    } else {
+        None
+    };
+    unsafe { libc::close(fd) };
+
+    match connect_err {
+        None => {
+            println!("✓ connect(cid={cid}, port={port}) → success");
+            Ok(())
+        }
+        Some(e) => {
+            let errno = e.raw_os_error().unwrap_or(0);
+            Err(format!(
+                "connect(cid={cid}, port={port}) failed: {e} (errno={errno}){}",
+                errno_hint(errno),
+            ))
+        }
+    }
+}
+
+/// Short human-readable hint for the most common errno values that the
+/// vsock path can return. Keeps the error output actionable without
+/// requiring the user to grep man pages.
+fn errno_hint(errno: i32) -> &'static str {
+    match errno {
+        libc::EACCES       => "  (SELinux denial on vsock_socket; check `dmesg | grep avc` or `logcat | grep avc`)",
+        libc::EAFNOSUPPORT => "  (kernel has no AF_VSOCK support; CONFIG_VSOCKETS is missing)",
+        libc::ENODEV       => "  (no vsock peer at this CID; the host VM is probably not running)",
+        libc::ECONNREFUSED => "  (peer is there but nothing is listening on that port)",
+        libc::ECONNRESET   => "  (peer exists and reset the connection; on VMADDR_CID_LOCAL this means kernel vsock loopback is working but no one is listening on that port — a GOOD signal about kernel support)",
+        libc::EPERM        => "  (operation not permitted; check process uid/capabilities)",
+        libc::ENETUNREACH  => "  (network unreachable; kernel vsock configuration may be incomplete)",
+        _                  => "",
+    }
 }
