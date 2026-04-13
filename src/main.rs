@@ -590,7 +590,7 @@ fn relay_loop(
     // 1. TCP connect to the target API server
     let mut tcp = TcpStream::connect(target)
         .map_err(|e| format!("TCP connect to {target} failed: {e}"))?;
-    tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)))
+    tcp.set_read_timeout(Some(std::time::Duration::from_secs(120)))
         .map_err(|e| format!("set_read_timeout: {e}"))?;
 
     // 2. Send initial TLS bytes (ClientHello)
