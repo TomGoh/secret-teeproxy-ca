@@ -40,11 +40,12 @@ pub(crate) const TA_UUID: &str = "a3f79c15-72d0-4e3a-b8d1-9f2ca3e81054";
 /// These are passed as `cmd_id` to `TEEC_InvokeCommand()`.
 
 pub(crate) const CMD_PROXY_REQUEST:  u32 = 0x0001;
-const CMD_PROVISION_KEY:  u32 = 0x0002;
+pub(crate) const CMD_PROVISION_KEY:  u32 = 0x0002;
 const CMD_REMOVE_KEY:     u32 = 0x0003;
-const CMD_LIST_SLOTS:     u32 = 0x0004;
+pub(crate) const CMD_LIST_SLOTS:     u32 = 0x0004;
 const CMD_ADD_WHITELIST:  u32 = 0x0005;
 pub(crate) const CMD_RELAY_DATA:     u32 = 0x0006;
+pub(crate) const CMD_LIST_SLOTS_META: u32 = 0x0007;
 
 /// Business result codes returned in `params[1].value.a` by the TA.
 /// Must match the constants in `secret_proxy_ta/src/main.rs`.
@@ -120,15 +121,22 @@ struct ProxyResponse {
     body: Vec<u8>,
 }
 
+/// Non-secret slot row from TA (`CMD_LIST_SLOTS_META`) — matches TA `SlotMeta` JSON.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SlotEntry {
+    pub slot: u32,
+    pub provider: String,
+}
+
 /// Payload for CMD_PROVISION_KEY (params[0] MemrefInput).
 #[derive(Debug, Serialize, Deserialize)]
-struct ProvisionKeyPayload {
+pub(crate) struct ProvisionKeyPayload {
     /// Key slot index to store the key in.
-    slot: u32,
+    pub slot: u32,
     /// The API key string (e.g. "sk-api--xxxxx").
-    key: String,
+    pub key: String,
     /// Provider name (e.g. "minimax", "moonshot").
-    provider: String,
+    pub provider: String,
 }
 
 /// Payload for CMD_ADD_WHITELIST (params[0] MemrefInput).
@@ -286,19 +294,8 @@ fn run() -> Result<(), String> {
 }
 
 /// List all occupied key slot IDs in the TA via CMD_LIST_SLOTS (0x0004).
-///
-/// # TEEC Parameters
-/// - `params[0]` MemrefOutput: JSON array of slot IDs (e.g. `[0, 1, 7]`)
-/// - `params[1]` ValueOutput:  `{a: BIZ_SUCCESS, b: slot_count}`
-///
-/// # Logic
-/// 1. Allocate a 4KB output buffer for the JSON array.
-/// 2. `TEEC_InvokeCommand(CMD_LIST_SLOTS)`.
-/// 3. Read `params[1].value.b` for the count and `params[0]` for the JSON.
-/// 4. Deserialize and print: `Slots (N total): [0, 1, 7]`.
-fn cmd_list_slots(session: &mut raw::TEEC_Session) -> Result<(), String> {
-    // params[0] MemrefOutput: JSON Vec<u32>
-    // params[1] ValueOutput:  {a: biz_code, b: count}
+/// Shared by CLI and HTTP admin API.
+pub(crate) fn teec_list_slots(session: &mut raw::TEEC_Session) -> Result<Vec<u32>, String> {
     let mut response_buf = vec![0u8; 4096];
     let mut op: raw::TEEC_Operation = unsafe { mem::zeroed() };
     op.paramTypes = raw::TEEC_PARAM_TYPES(
@@ -314,14 +311,120 @@ fn cmd_list_slots(session: &mut raw::TEEC_Session) -> Result<(), String> {
     let rc = TEEC_InvokeCommand(session, CMD_LIST_SLOTS, &mut op, &mut origin);
     check_teec_rc(rc, origin)?;
 
-    let (biz_code, count) = unsafe { (op.params[1].value.a, op.params[1].value.b) };
+    let biz_code = unsafe { op.params[1].value.a };
     check_biz_code(biz_code)?;
 
     let filled = unsafe { op.params[0].tmpref.size };
     let slots: Vec<u32> = serde_json::from_slice(&response_buf[..filled])
         .map_err(|e| format!("failed to parse slot list: {e}"))?;
 
+    Ok(slots)
+}
+
+/// List occupied slots with provider names (no key material) via CMD_LIST_SLOTS_META (0x0007).
+pub(crate) fn teec_list_slots_meta(session: &mut raw::TEEC_Session) -> Result<Vec<SlotEntry>, String> {
+    let mut response_buf = vec![0u8; 4096];
+    let mut op: raw::TEEC_Operation = unsafe { mem::zeroed() };
+    op.paramTypes = raw::TEEC_PARAM_TYPES(
+        raw::TEEC_MEMREF_TEMP_OUTPUT,
+        raw::TEEC_VALUE_OUTPUT,
+        raw::TEEC_NONE,
+        raw::TEEC_NONE,
+    );
+    op.params[0].tmpref.buffer = response_buf.as_mut_ptr() as *mut _;
+    op.params[0].tmpref.size = response_buf.len();
+
+    let mut origin = 0u32;
+    let rc = TEEC_InvokeCommand(session, CMD_LIST_SLOTS_META, &mut op, &mut origin);
+    check_teec_rc(rc, origin)?;
+
+    let biz_code = unsafe { op.params[1].value.a };
+    check_biz_code(biz_code)?;
+
+    let filled = unsafe { op.params[0].tmpref.size };
+    let entries: Vec<SlotEntry> = serde_json::from_slice(&response_buf[..filled])
+        .map_err(|e| format!("failed to parse slot meta list: {e}"))?;
+
+    Ok(entries)
+}
+
+/// Classify a TA/list probe error for `/health` and automation (`error_layer` field).
+pub(crate) fn ta_error_layer(message: &str) -> &'static str {
+    if message.contains("TEEC_InvokeCommand failed") {
+        "teec_invoke"
+    } else if message.contains("TA error") {
+        "ta_business"
+    } else if message.contains("failed to parse") {
+        "ca_parse"
+    } else {
+        "unknown"
+    }
+}
+
+/// List all occupied key slot IDs in the TA via CMD_LIST_SLOTS (0x0004).
+///
+/// # TEEC Parameters
+/// - `params[0]` MemrefOutput: JSON array of slot IDs (e.g. `[0, 1, 7]`)
+/// - `params[1]` ValueOutput:  `{a: BIZ_SUCCESS, b: slot_count}`
+///
+/// # Logic
+/// 1. Allocate a 4KB output buffer for the JSON array.
+/// 2. `TEEC_InvokeCommand(CMD_LIST_SLOTS)`.
+/// 3. Read `params[1].value.b` for the count and `params[0]` for the JSON.
+/// 4. Deserialize and print: `Slots (N total): [0, 1, 7]`.
+fn cmd_list_slots(session: &mut raw::TEEC_Session) -> Result<(), String> {
+    let slots = teec_list_slots(session)?;
+    let count = slots.len();
     println!("Slots ({count} total): {slots:?}");
+    Ok(())
+}
+
+/// Store an API key in the TA's key slot via CMD_PROVISION_KEY (0x0002).
+/// Shared by CLI and HTTP admin API.
+pub(crate) fn teec_provision_key(
+    session: &mut raw::TEEC_Session,
+    payload: &ProvisionKeyPayload,
+) -> Result<(), String> {
+    let mut json = serde_json::to_vec(payload).map_err(|e| format!("serialize error: {e}"))?;
+
+    let mut op: raw::TEEC_Operation = unsafe { mem::zeroed() };
+    op.paramTypes = raw::TEEC_PARAM_TYPES(
+        raw::TEEC_MEMREF_TEMP_INPUT,
+        raw::TEEC_VALUE_OUTPUT,
+        raw::TEEC_NONE,
+        raw::TEEC_NONE,
+    );
+    op.params[0].tmpref.buffer = json.as_mut_ptr() as *mut _;
+    op.params[0].tmpref.size = json.len();
+
+    let mut origin = 0u32;
+    let rc = TEEC_InvokeCommand(session, CMD_PROVISION_KEY, &mut op, &mut origin);
+    check_teec_rc(rc, origin)?;
+
+    let biz_code = unsafe { op.params[1].value.a };
+    check_biz_code(biz_code)?;
+
+    Ok(())
+}
+
+/// Remove an API key from a TA slot via CMD_REMOVE_KEY.
+pub(crate) fn teec_remove_key(session: &mut raw::TEEC_Session, slot: u32) -> Result<(), String> {
+    let mut op: raw::TEEC_Operation = unsafe { mem::zeroed() };
+    op.paramTypes = raw::TEEC_PARAM_TYPES(
+        raw::TEEC_VALUE_INPUT,
+        raw::TEEC_VALUE_OUTPUT,
+        raw::TEEC_NONE,
+        raw::TEEC_NONE,
+    );
+    op.params[0].value.a = slot;
+    op.params[0].value.b = 0;
+
+    let mut origin = 0u32;
+    let rc = TEEC_InvokeCommand(session, CMD_REMOVE_KEY, &mut op, &mut origin);
+    check_teec_rc(rc, origin)?;
+
+    let biz_code = unsafe { op.params[1].value.a };
+    check_biz_code(biz_code)?;
     Ok(())
 }
 
@@ -346,24 +449,7 @@ fn cmd_provision_key(session: &mut raw::TEEC_Session, args: &[String]) -> Result
     let provider = parse_arg_str(args, "--provider")?;
 
     let payload = ProvisionKeyPayload { slot, key, provider };
-    let mut json = serde_json::to_vec(&payload).map_err(|e| format!("serialize error: {e}"))?;
-
-    let mut op: raw::TEEC_Operation = unsafe { mem::zeroed() };
-    op.paramTypes = raw::TEEC_PARAM_TYPES(
-        raw::TEEC_MEMREF_TEMP_INPUT,
-        raw::TEEC_VALUE_OUTPUT,
-        raw::TEEC_NONE,
-        raw::TEEC_NONE,
-    );
-    op.params[0].tmpref.buffer = json.as_mut_ptr() as *mut _;
-    op.params[0].tmpref.size = json.len();
-
-    let mut origin = 0u32;
-    let rc = TEEC_InvokeCommand(session, CMD_PROVISION_KEY, &mut op, &mut origin);
-    check_teec_rc(rc, origin)?;
-
-    let biz_code = unsafe { op.params[1].value.a };
-    check_biz_code(biz_code)?;
+    teec_provision_key(session, &payload)?;
 
     println!("Key provisioned in slot {slot}");
     Ok(())
@@ -380,24 +466,7 @@ fn cmd_provision_key(session: &mut raw::TEEC_Session, args: &[String]) -> Result
 ///                             `{a: BIZ_ERR_KEY_NOT_FOUND, b: slot_id}`
 fn cmd_remove_key(session: &mut raw::TEEC_Session, args: &[String]) -> Result<(), String> {
     let slot = parse_arg_u32(args, "--slot")?;
-
-    let mut op: raw::TEEC_Operation = unsafe { mem::zeroed() };
-    op.paramTypes = raw::TEEC_PARAM_TYPES(
-        raw::TEEC_VALUE_INPUT,
-        raw::TEEC_VALUE_OUTPUT,
-        raw::TEEC_NONE,
-        raw::TEEC_NONE,
-    );
-    op.params[0].value.a = slot;
-    op.params[0].value.b = 0;
-
-    let mut origin = 0u32;
-    let rc = TEEC_InvokeCommand(session, CMD_REMOVE_KEY, &mut op, &mut origin);
-    check_teec_rc(rc, origin)?;
-
-    let biz_code = unsafe { op.params[1].value.a };
-    check_biz_code(biz_code)?;
-
+    teec_remove_key(session, slot)?;
     println!("Slot {slot} removed");
     Ok(())
 }
@@ -822,6 +891,9 @@ fn print_usage(prog: &str) {
     eprintln!("or missing kernel support (EAFNOSUPPORT). Default port is 9999.");
     eprintln!();
     eprintln!("Logging: set RUST_LOG=debug for verbose relay details.");
+    eprintln!();
+    eprintln!("serve: GET /health (TEEC+TA probe, no auth); admin API: set SECRET_PROXY_CA_ADMIN_TOKEN");
+    eprintln!("  X-Admin-Token for GET /admin/keys/slots and POST /admin/keys/provision");
 }
 
 /// Raw `sockaddr_vm` as defined in `<linux/vm_sockets.h>`.

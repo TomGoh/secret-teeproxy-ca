@@ -30,15 +30,33 @@ use cc_teec::{
     TEEC_CloseSession, TEEC_FinalizeContext, TEEC_InitializeContext, TEEC_InvokeCommand,
     TEEC_OpenSession, raw,
 };
-use log::{info, debug, warn, error};
-use serde::Deserialize;
+use log::{debug, error, info, warn};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     parse_arg_u32, parse_uuid, check_teec_rc,
+    ta_error_layer, teec_list_slots, teec_list_slots_meta, teec_provision_key, teec_remove_key,
+    ProvisionKeyPayload,
+    SlotEntry,
     TA_UUID, CMD_PROXY_REQUEST, CMD_RELAY_DATA,
     BIZ_RELAY_START, BIZ_RELAY_CONTINUE, BIZ_RELAY_DONE, BIZ_RELAY_STREAMING,
     HttpMethod, ProxyRequest,
 };
+
+/// Env var: shared secret required for `GET/POST /admin/*` (HTTP header `X-Admin-Token`).
+const ADMIN_TOKEN_ENV: &str = "SECRET_PROXY_CA_ADMIN_TOKEN";
+/// Optional previous token during rotation window.
+const ADMIN_TOKEN_PREV_ENV: &str = "SECRET_PROXY_CA_ADMIN_TOKEN_PREV";
+const ADMIN_TOKEN_MIN_LEN: usize = 32;
+const ADMIN_ACTOR_HEADER: &str = "x-openclaw-actor";
+const ADMIN_REQUEST_ID_HEADER: &str = "x-request-id";
+
+#[derive(Clone, Debug)]
+struct AdminAuditContext {
+    actor: String,
+    request_id: String,
+    source: String,
+}
 
 /// Fields extracted from the incoming HTTP POST body.
 /// Uses `serde(default)` to tolerate extra fields from OpenClaw's `Object.assign`.
@@ -102,12 +120,32 @@ pub fn cmd_serve(args: &[String]) -> Result<(), String> {
 
     info!("TEEC session established (persistent)");
 
+    if let Ok(token) = std::env::var(ADMIN_TOKEN_ENV) {
+        if token.is_empty() {
+            return Err(format!("{ADMIN_TOKEN_ENV} is set but empty"));
+        }
+        validate_admin_token_strength(&token)
+            .map_err(|e| format!("invalid {ADMIN_TOKEN_ENV}: {e}"))?;
+        if let Ok(prev_token) = std::env::var(ADMIN_TOKEN_PREV_ENV) {
+            if !prev_token.is_empty() {
+                validate_admin_token_strength(&prev_token)
+                    .map_err(|e| format!("invalid {ADMIN_TOKEN_PREV_ENV}: {e}"))?;
+            }
+        }
+    } else {
+        warn!("admin API disabled: set {ADMIN_TOKEN_ENV} to enable admin endpoints");
+    }
+
     // Bind HTTP server
     let listener = TcpListener::bind(format!("0.0.0.0:{port}"))
         .map_err(|e| format!("TCP bind failed: {e}"))?;
 
     info!("HTTP server listening on http://0.0.0.0:{port}");
-    info!("accepts POST with SecretProxyRequest JSON, returns SSE");
+    info!("proxy: POST / with SecretProxyRequest JSON → SSE");
+    info!("health: GET /health (TEEC + TA probe, no auth)");
+    info!(
+        "admin: GET /admin/keys/slots, POST /admin/keys/provision, POST /admin/keys/remove (requires {ADMIN_TOKEN_ENV})"
+    );
 
     for stream in listener.incoming() {
         match stream {
@@ -125,44 +163,511 @@ pub fn cmd_serve(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Handle one HTTP connection: read request, run TEEC relay, stream SSE response.
+fn normalize_http_path(raw: &str) -> &str {
+    raw.split('?').next().unwrap_or(raw).trim()
+}
+
+fn header_value(headers_block: &str, name_lc: &str) -> Option<String> {
+    let prefix = format!("{name_lc}:");
+    for line in headers_block.lines() {
+        let lower = line.to_lowercase();
+        if lower.starts_with(&prefix) {
+            return line.splitn(2, ':').nth(1).map(|s| s.trim().to_string());
+        }
+    }
+    None
+}
+
+fn constant_time_equal(a: &str, b: &str) -> bool {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    let mut diff = a_bytes.len() ^ b_bytes.len();
+    let max_len = a_bytes.len().max(b_bytes.len());
+    for idx in 0..max_len {
+        let av = a_bytes.get(idx).copied().unwrap_or(0);
+        let bv = b_bytes.get(idx).copied().unwrap_or(0);
+        diff |= (av ^ bv) as usize;
+    }
+    diff == 0
+}
+
+fn validate_admin_token_strength(token: &str) -> Result<(), String> {
+    if token.len() < ADMIN_TOKEN_MIN_LEN {
+        return Err("token length must be >= 32 bytes".into());
+    }
+    let weak_values = ["dev-admin-token", "admin", "password", "123456", "changeme"];
+    if weak_values.iter().any(|v| constant_time_equal(token, v)) {
+        return Err("token value is too weak".into());
+    }
+    Ok(())
+}
+
+fn admin_audit_context(headers_block: &str, client: &TcpStream) -> AdminAuditContext {
+    let actor = header_value(headers_block, ADMIN_ACTOR_HEADER).unwrap_or_else(|| "unknown".into());
+    let request_id =
+        header_value(headers_block, ADMIN_REQUEST_ID_HEADER).unwrap_or_else(|| "none".into());
+    let source = client
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "unknown".into());
+    AdminAuditContext {
+        actor,
+        request_id,
+        source,
+    }
+}
+
+fn send_json_response(client: &mut TcpStream, status: u16, status_text: &str, json_body: &str) {
+    let response = format!(
+        "HTTP/1.1 {status} {status_text}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {json_body}",
+        json_body.len()
+    );
+    let _ = client.write_all(response.as_bytes());
+}
+
+/// Validate `X-Admin-Token` against `SECRET_PROXY_CA_ADMIN_TOKEN`. If env is unset/empty, admin is disabled.
+fn check_admin_token(headers_block: &str) -> Result<(), &'static str> {
+    let expected = match std::env::var(ADMIN_TOKEN_ENV) {
+        Ok(t) if !t.is_empty() => t,
+        _ => return Err("admin API disabled (set SECRET_PROXY_CA_ADMIN_TOKEN)"),
+    };
+    let expected_prev = std::env::var(ADMIN_TOKEN_PREV_ENV)
+        .ok()
+        .filter(|t| !t.is_empty());
+    let provided = header_value(headers_block, "x-admin-token").unwrap_or_default();
+    let current_match = constant_time_equal(&provided, &expected);
+    let previous_match = expected_prev
+        .as_ref()
+        .map(|prev| constant_time_equal(&provided, prev))
+        .unwrap_or(false);
+    if !(current_match || previous_match) {
+        return Err("invalid admin token");
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct AdminProvisionBody {
+    slot: u32,
+    key: String,
+    provider: String,
+}
+
+#[derive(Deserialize)]
+struct AdminRemoveBody {
+    slot: u32,
+}
+
+#[derive(Serialize)]
+struct AdminOkProvision {
+    ok: bool,
+    slot: u32,
+    /// True when post-provision list includes `slot` (automation signal).
+    verified: bool,
+    slots: Vec<u32>,
+    slot_entries: Vec<SlotEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification_warning: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AdminOkSlots {
+    ok: bool,
+    slots: Vec<u32>,
+    /// Provider per occupied slot (no key material); may be empty if meta probe failed.
+    slot_entries: Vec<SlotEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta_warning: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AdminOkRemove {
+    ok: bool,
+    slot: u32,
+    slots: Vec<u32>,
+    slot_entries: Vec<SlotEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification_warning: Option<String>,
+}
+
+#[derive(Serialize)]
+struct HealthBody {
+    ok: bool,
+    service: &'static str,
+    teec_session: &'static str,
+    ta: HealthTa,
+}
+
+#[derive(Serialize)]
+struct HealthTa {
+    reachable: bool,
+    /// Primary probe: `CMD_LIST_SLOTS` (TA must respond).
+    probe: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slots: Option<Vec<u32>>,
+    /// Secondary: `CMD_LIST_SLOTS_META`; empty if unsupported or failed (see `meta_warning`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slot_entries: Option<Vec<SlotEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta_warning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_layer: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+/// Handle one HTTP connection: read request, optional admin API, or TEEC relay + SSE.
 fn handle_http_connection(
     session: &mut raw::TEEC_Session,
     mut client: TcpStream,
 ) -> Result<(), String> {
-    // 1. Read HTTP request headers
     let mut reader = BufReader::new(&client);
+    let mut request_line = String::new();
+    reader
+        .read_line(&mut request_line)
+        .map_err(|e| format!("read request line: {e}"))?;
+
+    let mut parts = request_line.split_whitespace();
+    let http_method = parts.next().unwrap_or("").to_ascii_uppercase();
+    let raw_path = parts.next().unwrap_or("/");
+    let path = normalize_http_path(raw_path).to_string();
+
     let mut headers_text = String::new();
     loop {
         let mut line = String::new();
-        reader.read_line(&mut line)
+        reader
+            .read_line(&mut line)
             .map_err(|e| format!("read header line: {e}"))?;
         if line == "\r\n" || line == "\n" || line.is_empty() {
             break;
         }
         headers_text.push_str(&line);
     }
+    let audit_ctx = admin_audit_context(&headers_text, &client);
 
-    // 2. Parse Content-Length and read body
     let content_length = headers_text
         .lines()
         .find_map(|line| {
             let lower = line.to_lowercase();
             if lower.starts_with("content-length:") {
-                lower.trim_start_matches("content-length:").trim().parse::<usize>().ok()
+                lower
+                    .trim_start_matches("content-length:")
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
             } else {
                 None
             }
         })
         .unwrap_or(0);
 
+    // --- GET /health (no auth): TEEC session open + TA list probe ---
+    if path == "/health" && http_method == "GET" {
+        let health = match teec_list_slots(session) {
+            Ok(slots) => {
+                let (slot_entries, meta_warning) = match teec_list_slots_meta(session) {
+                    Ok(e) => (Some(e), None),
+                    Err(e) => (Some(Vec::new()), Some(e)),
+                };
+                HealthBody {
+                    ok: true,
+                    service: "secret_proxy_ca",
+                    teec_session: "open",
+                    ta: HealthTa {
+                        reachable: true,
+                        probe: "list_slots",
+                        slots: Some(slots),
+                        slot_entries,
+                        meta_warning,
+                        error_layer: None,
+                        message: None,
+                    },
+                }
+            }
+            Err(e) => {
+                let layer = ta_error_layer(&e);
+                HealthBody {
+                    ok: false,
+                    service: "secret_proxy_ca",
+                    teec_session: "open",
+                    ta: HealthTa {
+                        reachable: false,
+                        probe: "list_slots",
+                        slots: None,
+                        slot_entries: None,
+                        meta_warning: None,
+                        error_layer: Some(layer),
+                        message: Some(e),
+                    },
+                }
+            }
+        };
+        let json = serde_json::to_string(&health).unwrap_or_else(|_| r#"{"ok":false}"#.into());
+        send_json_response(&mut client, 200, "OK", &json);
+        info!(
+            "health: ta_reachable={} probe=list_slots",
+            health.ta.reachable
+        );
+        return Ok(());
+    }
+
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
-        reader.read_exact(&mut body)
+        reader
+            .read_exact(&mut body)
             .map_err(|e| format!("read body: {e}"))?;
     }
 
-    // 3. Parse SecretProxyRequest (ignore extra fields from OpenClaw's Object.assign)
+    // --- Admin API (same TEEC session as proxy) ---
+    if path == "/admin/keys/slots" && http_method == "GET" {
+        if let Err(reason) = check_admin_token(&headers_text) {
+            let status = if reason.contains("disabled") { 503 } else { 401 };
+            let text = if status == 503 {
+                "Service Unavailable"
+            } else {
+                "Unauthorized"
+            };
+            let msg = serde_json::json!({ "ok": false, "error": reason }).to_string();
+            send_json_response(&mut client, status, text, &msg);
+            warn!(
+                "audit event=admin_list_slots result=deny actor={} request_id={} source={} reason={}",
+                audit_ctx.actor, audit_ctx.request_id, audit_ctx.source, reason
+            );
+            return Err(reason.into());
+        }
+        match teec_list_slots(session) {
+            Ok(slots) => {
+                let (slot_entries, meta_warning) = match teec_list_slots_meta(session) {
+                    Ok(e) => (e, None),
+                    Err(e) => {
+                        warn!("admin list_slots: slot metadata unavailable: {e}");
+                        (Vec::new(), Some(e))
+                    }
+                };
+                info!(
+                    "audit event=admin_list_slots result=ok actor={} request_id={} source={} count={} entries={} meta_ok={}",
+                    audit_ctx.actor,
+                    audit_ctx.request_id,
+                    audit_ctx.source,
+                    slots.len(),
+                    slot_entries.len(),
+                    meta_warning.is_none()
+                );
+                let json = serde_json::to_string(&AdminOkSlots {
+                    ok: true,
+                    slots,
+                    slot_entries,
+                    meta_warning,
+                })
+                .unwrap_or_else(|_| r#"{"ok":false,"error":"serialize"}"#.into());
+                send_json_response(&mut client, 200, "OK", &json);
+                Ok(())
+            }
+            Err(e) => {
+                let msg = serde_json::json!({ "ok": false, "error": e }).to_string();
+                send_json_response(&mut client, 502, "Bad Gateway", &msg);
+                warn!(
+                    "audit event=admin_list_slots result=error actor={} request_id={} source={} error={}",
+                    audit_ctx.actor, audit_ctx.request_id, audit_ctx.source, e
+                );
+                Err(e)
+            }
+        }
+    } else if path == "/admin/keys/provision" && http_method == "POST" {
+        if let Err(reason) = check_admin_token(&headers_text) {
+            let status = if reason.contains("disabled") { 503 } else { 401 };
+            let text = if status == 503 {
+                "Service Unavailable"
+            } else {
+                "Unauthorized"
+            };
+            let msg = serde_json::json!({ "ok": false, "error": reason }).to_string();
+            send_json_response(&mut client, status, text, &msg);
+            warn!(
+                "audit event=admin_provision result=deny actor={} request_id={} source={} reason={}",
+                audit_ctx.actor, audit_ctx.request_id, audit_ctx.source, reason
+            );
+            return Err(reason.into());
+        }
+        let parsed: AdminProvisionBody = match serde_json::from_slice(&body) {
+            Ok(p) => p,
+            Err(e) => {
+                let msg = serde_json::json!({ "ok": false, "error": format!("invalid JSON: {e}") })
+                    .to_string();
+                send_json_response(&mut client, 400, "Bad Request", &msg);
+                warn!(
+                    "audit event=admin_provision result=error actor={} request_id={} source={} reason=bad_json",
+                    audit_ctx.actor, audit_ctx.request_id, audit_ctx.source
+                );
+                return Err(format!("admin provision bad JSON: {e}"));
+            }
+        };
+        info!(
+            "audit event=admin_provision result=start actor={} request_id={} source={} slot={} provider={} key_len={}",
+            audit_ctx.actor,
+            audit_ctx.request_id,
+            audit_ctx.source,
+            parsed.slot,
+            parsed.provider,
+            parsed.key.len()
+        );
+        let payload = ProvisionKeyPayload {
+            slot: parsed.slot,
+            key: parsed.key,
+            provider: parsed.provider,
+        };
+        match teec_provision_key(session, &payload) {
+            Ok(()) => {
+                let slot_id = payload.slot;
+                let (verified, slots, slot_entries, verification_warning) =
+                    match (teec_list_slots(session), teec_list_slots_meta(session)) {
+                        (Ok(s), Ok(e)) => {
+                            let v = s.contains(&slot_id);
+                            (v, s, e, None)
+                        }
+                        (Ok(s), Err(e)) => {
+                            warn!("admin provision: post-verify meta failed: {e}");
+                            (s.contains(&slot_id), s, Vec::new(), Some(e))
+                        }
+                        (Err(e), _) => {
+                            warn!("admin provision: post-verify list failed: {e}");
+                            (
+                                false,
+                                Vec::new(),
+                                Vec::new(),
+                                Some(format!("post-provision list_slots failed: {e}")),
+                            )
+                        }
+                    };
+                info!(
+                    "audit event=admin_provision result=ok actor={} request_id={} source={} slot={} verified={} slots_count={}",
+                    audit_ctx.actor,
+                    audit_ctx.request_id,
+                    audit_ctx.source,
+                    slot_id,
+                    verified,
+                    slots.len(),
+                );
+                let json = serde_json::to_string(&AdminOkProvision {
+                    ok: true,
+                    slot: slot_id,
+                    verified,
+                    slots,
+                    slot_entries,
+                    verification_warning,
+                })
+                .unwrap_or_else(|_| r#"{"ok":false}"#.into());
+                send_json_response(&mut client, 200, "OK", &json);
+                Ok(())
+            }
+            Err(e) => {
+                let msg = serde_json::json!({ "ok": false, "error": e }).to_string();
+                send_json_response(&mut client, 502, "Bad Gateway", &msg);
+                warn!(
+                    "audit event=admin_provision result=error actor={} request_id={} source={} slot={} error={}",
+                    audit_ctx.actor, audit_ctx.request_id, audit_ctx.source, payload.slot, e
+                );
+                Err(e)
+            }
+        }
+    } else if path == "/admin/keys/remove" && http_method == "POST" {
+        if let Err(reason) = check_admin_token(&headers_text) {
+            let status = if reason.contains("disabled") { 503 } else { 401 };
+            let text = if status == 503 {
+                "Service Unavailable"
+            } else {
+                "Unauthorized"
+            };
+            let msg = serde_json::json!({ "ok": false, "error": reason }).to_string();
+            send_json_response(&mut client, status, text, &msg);
+            warn!(
+                "audit event=admin_remove result=deny actor={} request_id={} source={} reason={}",
+                audit_ctx.actor, audit_ctx.request_id, audit_ctx.source, reason
+            );
+            return Err(reason.into());
+        }
+        let parsed: AdminRemoveBody = match serde_json::from_slice(&body) {
+            Ok(p) => p,
+            Err(e) => {
+                let msg = serde_json::json!({ "ok": false, "error": format!("invalid JSON: {e}") })
+                    .to_string();
+                send_json_response(&mut client, 400, "Bad Request", &msg);
+                warn!(
+                    "audit event=admin_remove result=error actor={} request_id={} source={} reason=bad_json",
+                    audit_ctx.actor, audit_ctx.request_id, audit_ctx.source
+                );
+                return Err(format!("admin remove bad JSON: {e}"));
+            }
+        };
+        match teec_remove_key(session, parsed.slot) {
+            Ok(()) => {
+                let (slots, slot_entries, verification_warning) =
+                    match (teec_list_slots(session), teec_list_slots_meta(session)) {
+                        (Ok(s), Ok(e)) => (s, e, None),
+                        (Ok(s), Err(e)) => {
+                            warn!("admin remove: post-verify meta failed: {e}");
+                            (s, Vec::new(), Some(e))
+                        }
+                        (Err(e), _) => {
+                            warn!("admin remove: post-verify list failed: {e}");
+                            (
+                                Vec::new(),
+                                Vec::new(),
+                                Some(format!("post-remove list_slots failed: {e}")),
+                            )
+                        }
+                    };
+                info!(
+                    "audit event=admin_remove result=ok actor={} request_id={} source={} slot={} slots_count={}",
+                    audit_ctx.actor,
+                    audit_ctx.request_id,
+                    audit_ctx.source,
+                    parsed.slot,
+                    slots.len()
+                );
+                let json = serde_json::to_string(&AdminOkRemove {
+                    ok: true,
+                    slot: parsed.slot,
+                    slots,
+                    slot_entries,
+                    verification_warning,
+                })
+                .unwrap_or_else(|_| r#"{"ok":false}"#.into());
+                send_json_response(&mut client, 200, "OK", &json);
+                Ok(())
+            }
+            Err(e) => {
+                let msg = serde_json::json!({ "ok": false, "error": e }).to_string();
+                send_json_response(&mut client, 502, "Bad Gateway", &msg);
+                warn!(
+                    "audit event=admin_remove result=error actor={} request_id={} source={} slot={} error={}",
+                    audit_ctx.actor, audit_ctx.request_id, audit_ctx.source, parsed.slot, e
+                );
+                Err(e)
+            }
+        }
+    } else if http_method != "POST" {
+        let msg = serde_json::json!({ "ok": false, "error": "method not allowed for this path" })
+            .to_string();
+        send_json_response(&mut client, 405, "Method Not Allowed", &msg);
+        Err("bad HTTP method".into())
+    } else {
+        handle_proxy_post(session, client, body)
+    }
+}
+
+/// LLM proxy: parse `SecretProxyRequest` JSON and stream SSE (ignore extra fields from OpenClaw's `Object.assign`).
+fn handle_proxy_post(
+    session: &mut raw::TEEC_Session,
+    mut client: TcpStream,
+    body: Vec<u8>,
+) -> Result<(), String> {
+    // Parse SecretProxyRequest
     let incoming: IncomingProxyRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
