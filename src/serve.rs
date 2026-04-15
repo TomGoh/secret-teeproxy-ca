@@ -829,6 +829,10 @@ fn relay_and_stream(
     initial_tls: &[u8],
     client: &mut TcpStream,
 ) -> Result<(), String> {
+    // Disable Nagle on the client connection so SSE events are pushed
+    // immediately instead of being batched by the kernel.
+    let _ = client.set_nodelay(true);
+
     // TCP connect to LLM API server
     let mut tcp = TcpStream::connect(target)
         .map_err(|e| format!("TCP connect to {target}: {e}"))?;
@@ -1042,54 +1046,30 @@ fn relay_and_stream(
                 }
 
                 if !response_started && filled > 0 {
-                    // The TA completed the relay in a single round (short
-                    // response that fit entirely within one CMD_RELAY_DATA).
-                    // The decrypted bytes contain the upstream HTTP response
-                    // (headers + body) just like BIZ_RELAY_STREAMING's first
-                    // chunk.  Forward it as SSE so the Anthropic SDK parser
-                    // sees the expected event stream instead of raw JSON.
+                    // The TA completed the relay in a single round — the
+                    // decrypted data is a ProxyResponse JSON (not raw HTTP).
+                    // Parse it and forward the body with the correct
+                    // content-type so the Anthropic SDK's SSE parser works.
                     let decrypted = &response_buf[..filled];
-                    let (http_status, body_start) = parse_upstream_headers(decrypted);
+                    let resp: crate::ProxyResponse = serde_json::from_slice(decrypted)
+                        .map_err(|e| format!("parse ProxyResponse: {e}"))?;
 
-                    if body_start > 0 && body_start < decrypted.len() {
-                        // Upstream HTTP response — forward as SSE
-                        let response_headers = format!(
-                            "HTTP/1.1 {} OK\r\n\
-                             Content-Type: text/event-stream; charset=utf-8\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Connection: close\r\n\
-                             \r\n",
-                            http_status
-                        );
-                        client.write_all(response_headers.as_bytes())
-                            .map_err(|e| format!("client write headers: {e}"))?;
-
-                        let body_data = &decrypted[body_start..];
-                        // Strip chunked framing if present
-                        let mut cr: usize = 0;
-                        let mut cp = Vec::new();
-                        let output = strip_chunked_framing(body_data, &mut cr, &mut cp);
-                        let output = if output.is_empty() { body_data.to_vec() } else { output };
-                        log_sse_content(&output);
-                        client.write_all(&output)
-                            .map_err(|e| format!("client write body: {e}"))?;
-                    } else {
-                        // Not an HTTP response — fall back to JSON envelope
-                        let resp: crate::ProxyResponse = serde_json::from_slice(decrypted)
-                            .map_err(|e| format!("parse ProxyResponse: {e}"))?;
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Connection: close\r\n\
-                             \r\n",
-                            resp.body.len()
-                        );
-                        client.write_all(response.as_bytes())
-                            .map_err(|e| format!("client write: {e}"))?;
-                        client.write_all(&resp.body)
-                            .map_err(|e| format!("client write body: {e}"))?;
-                    }
+                    let content_type = resp.headers.get("content-type")
+                        .map(|s| s.as_str())
+                        .unwrap_or("application/json");
+                    let response_headers = format!(
+                        "HTTP/1.1 {} OK\r\n\
+                         Content-Type: {content_type}\r\n\
+                         Content-Length: {}\r\n\
+                         Connection: close\r\n\
+                         \r\n",
+                        resp.status, resp.body.len()
+                    );
+                    log_sse_content(&resp.body);
+                    client.write_all(response_headers.as_bytes())
+                        .map_err(|e| format!("client write headers: {e}"))?;
+                    client.write_all(&resp.body)
+                        .map_err(|e| format!("client write body: {e}"))?;
                 }
 
                 let _ = client.flush();
