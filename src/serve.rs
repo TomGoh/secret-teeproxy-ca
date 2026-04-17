@@ -893,16 +893,13 @@ fn relay_and_stream(
                     }
                     debug!("upstream chunked encoding: {is_chunked}");
 
-                    // Write HTTP response headers to OpenClaw client
-                    let response_headers = format!(
-                        "HTTP/1.1 {} OK\r\n\
-                         Content-Type: text/event-stream; charset=utf-8\r\n\
-                         Cache-Control: no-cache\r\n\
-                         Connection: close\r\n\
-                         \r\n",
-                        http_status
-                    );
-                    client.write_all(response_headers.as_bytes())
+                    // Write HTTP response headers to OpenClaw client.
+                    // Step 6 refactor: header assembly moved to
+                    // `crate::sse::encoder::sse_response_headers`; bytes
+                    // byte-for-byte identical, regression-pinned by the
+                    // `preamble_exact_bytes` unit test.
+                    let response_headers = crate::sse::encoder::sse_response_headers(http_status);
+                    client.write_all(&response_headers)
                         .map_err(|e| format!("client write headers: {e}"))?;
                     response_started = true;
 
@@ -990,69 +987,16 @@ fn relay_and_stream(
     }
 }
 
-/// Log SSE event content, extracting the actual text from Anthropic-format events.
+/// Log Anthropic-format SSE events so the operator can tail the daemon
+/// log and see the LLM's actual words in real time.
 ///
-/// Parses `data: {...}` lines and prints the text deltas and thinking content
-/// so the operator can see the LLM's real words in the log.
+/// Step 6 refactor: the 60-line inline event parser moved into
+/// `crate::sse::parser::parse_events` (pure, unit-testable) and the
+/// logging side-effect into `sse::parser::log_event`. This wrapper is
+/// the one remaining call site in serve.rs; keep it trivially thin.
 fn log_sse_content(data: &[u8]) {
-    let Ok(text) = std::str::from_utf8(data) else { return };
-    for line in text.lines() {
-        if !line.starts_with("data: ") {
-            continue;
-        }
-        let json_str = &line["data: ".len()..];
-        if json_str == "[DONE]" {
-            info!("◄ [DONE]");
-            continue;
-        }
-        let Ok(event) = serde_json::from_str::<serde_json::Value>(json_str) else { continue };
-        let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        match event_type {
-            "content_block_delta" => {
-                if let Some(delta) = event.get("delta") {
-                    let delta_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                    match delta_type {
-                        "text_delta" => {
-                            if let Some(t) = delta.get("text").and_then(|t| t.as_str()) {
-                                eprint!("{t}");
-                            }
-                        }
-                        "thinking_delta" => {
-                            if let Some(t) = delta.get("thinking").and_then(|t| t.as_str()) {
-                                eprint!("{t}");
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            "content_block_start" => {
-                if let Some(cb) = event.get("content_block") {
-                    let cb_type = cb.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                    match cb_type {
-                        "thinking" => info!("\n◄ [thinking]"),
-                        "text" => info!("\n◄ [text]"),
-                        _ => info!("\n◄ [block:{cb_type}]"),
-                    }
-                }
-            }
-            "message_start" => {
-                if let Some(msg) = event.get("message") {
-                    let model = msg.get("model").and_then(|m| m.as_str()).unwrap_or("?");
-                    let id = msg.get("id").and_then(|i| i.as_str()).unwrap_or("?");
-                    info!("◄ message_start (model={model}, id={id})");
-                }
-            }
-            "message_delta" => {
-                if let Some(usage) = event.get("usage") {
-                    info!("\n◄ message_delta (usage: {usage})");
-                }
-            }
-            "message_stop" => {
-                info!("\n◄ message_stop");
-            }
-            _ => {}
-        }
+    for ev in crate::sse::parser::parse_events(data) {
+        crate::sse::parser::log_event(&ev);
     }
 }
 
