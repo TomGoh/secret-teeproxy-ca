@@ -294,45 +294,19 @@ fn handle_http_connection(
     session: &mut raw::TEEC_Session,
     mut client: TcpStream,
 ) -> Result<(), String> {
+    // Step 3 refactor: inline request parsing (request line + headers +
+    // body read) migrated to `crate::http::request::parse_request`. Local
+    // bindings `http_method`, `path`, `headers_text`, `content_length`,
+    // `body` are kept identically named so the downstream 350+ lines of
+    // routing logic continue to work without churn.
     let mut reader = BufReader::new(&client);
-    let mut request_line = String::new();
-    reader
-        .read_line(&mut request_line)
-        .map_err(|e| format!("read request line: {e}"))?;
-
-    let mut parts = request_line.split_whitespace();
-    let http_method = parts.next().unwrap_or("").to_ascii_uppercase();
-    let raw_path = parts.next().unwrap_or("/");
-    let path = normalize_http_path(raw_path).to_string();
-
-    let mut headers_text = String::new();
-    loop {
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .map_err(|e| format!("read header line: {e}"))?;
-        if line == "\r\n" || line == "\n" || line.is_empty() {
-            break;
-        }
-        headers_text.push_str(&line);
-    }
+    let req = crate::http::request::parse_request(&mut reader)?;
+    let http_method = req.method;
+    let path = req.path;
+    let headers_text = req.headers_text;
+    let content_length = req.content_length;
+    let body = req.body;
     let audit_ctx = admin_audit_context(&headers_text, &client);
-
-    let content_length = headers_text
-        .lines()
-        .find_map(|line| {
-            let lower = line.to_lowercase();
-            if lower.starts_with("content-length:") {
-                lower
-                    .trim_start_matches("content-length:")
-                    .trim()
-                    .parse::<usize>()
-                    .ok()
-            } else {
-                None
-            }
-        })
-        .unwrap_or(0);
 
     // --- GET /health (no auth): TEEC session open + TA list probe ---
     if path == "/health" && http_method == "GET" {
@@ -384,12 +358,8 @@ fn handle_http_connection(
         return Ok(());
     }
 
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        reader
-            .read_exact(&mut body)
-            .map_err(|e| format!("read body: {e}"))?;
-    }
+    // Body was already read by parse_request; no additional I/O needed here.
+    // (Previously this block did: vec![0u8; content_length]; reader.read_exact(&mut body))
 
     // --- Admin API (same TEEC session as proxy) ---
     if path == "/admin/keys/slots" && http_method == "GET" {
