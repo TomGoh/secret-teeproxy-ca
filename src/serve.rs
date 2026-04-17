@@ -43,7 +43,9 @@ use crate::{
     HttpMethod, ProxyRequest,
     // Admin-API constants (moved to crate::constants in Step 1 refactor,
     // re-exported at crate root — see main.rs top).
-    ADMIN_TOKEN_ENV, ADMIN_TOKEN_PREV_ENV, ADMIN_TOKEN_MIN_LEN,
+    // ADMIN_TOKEN_MIN_LEN migrated with `validate_admin_token_strength` to
+    // `crate::http::headers` in Step 2, so no longer imported here.
+    ADMIN_TOKEN_ENV, ADMIN_TOKEN_PREV_ENV,
     ADMIN_ACTOR_HEADER, ADMIN_REQUEST_ID_HEADER,
 };
 
@@ -159,44 +161,14 @@ pub fn cmd_serve(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn normalize_http_path(raw: &str) -> &str {
-    raw.split('?').next().unwrap_or(raw).trim()
-}
-
-fn header_value(headers_block: &str, name_lc: &str) -> Option<String> {
-    let prefix = format!("{name_lc}:");
-    for line in headers_block.lines() {
-        let lower = line.to_lowercase();
-        if lower.starts_with(&prefix) {
-            return line.splitn(2, ':').nth(1).map(|s| s.trim().to_string());
-        }
-    }
-    None
-}
-
-fn constant_time_equal(a: &str, b: &str) -> bool {
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-    let mut diff = a_bytes.len() ^ b_bytes.len();
-    let max_len = a_bytes.len().max(b_bytes.len());
-    for idx in 0..max_len {
-        let av = a_bytes.get(idx).copied().unwrap_or(0);
-        let bv = b_bytes.get(idx).copied().unwrap_or(0);
-        diff |= (av ^ bv) as usize;
-    }
-    diff == 0
-}
-
-fn validate_admin_token_strength(token: &str) -> Result<(), String> {
-    if token.len() < ADMIN_TOKEN_MIN_LEN {
-        return Err("token length must be >= 32 bytes".into());
-    }
-    let weak_values = ["dev-admin-token", "admin", "password", "123456", "changeme"];
-    if weak_values.iter().any(|v| constant_time_equal(token, v)) {
-        return Err("token value is too weak".into());
-    }
-    Ok(())
-}
+// Pure header / token helpers moved to `crate::http::headers` in Step 2.
+// `validate_admin_token_strength` now returns `Result<(), &'static str>` —
+// the existing `.map_err(|e| format!("... {e}"))` call sites compose the same
+// way since both `&str` and `String` implement `Display`.
+use crate::http::headers::{
+    constant_time_equal, header_value, normalize_http_path, validate_admin_token_strength,
+};
+use crate::http::chunked::ChunkedDecoder;
 
 fn admin_audit_context(headers_block: &str, client: &TcpStream) -> AdminAuditContext {
     let actor = header_value(headers_block, ADMIN_ACTOR_HEADER).unwrap_or_else(|| "unknown".into());
@@ -847,10 +819,12 @@ fn relay_and_stream(
     let mut round = 0u32;
     // Track whether upstream uses chunked encoding (detected from response headers)
     let mut is_chunked = false;
-    // Chunked decoder state: bytes remaining in current chunk (carried across relay rounds)
-    let mut chunk_remaining: usize = 0;
-    // Buffer for incomplete chunked framing data across relay rounds.
-    let mut chunk_pending = Vec::<u8>::new();
+    // Chunked decoder (stateful across relay rounds — carries partial chunks
+    // and partial size lines between TA roundtrips).
+    // Step 2 refactor: replaced the prior pair of `chunk_remaining` / `chunk_pending`
+    // locals with a single struct that encapsulates both. Behavior identical
+    // (Lenient fallback: parse failure dumps pending buffer as raw).
+    let mut chunked_decoder = ChunkedDecoder::new();
 
     loop {
         round += 1;
@@ -1004,7 +978,7 @@ fn relay_and_stream(
                     if body_start < decrypted.len() {
                         let body_data = &decrypted[body_start..];
                         let output = if is_chunked {
-                            strip_chunked_framing(body_data, &mut chunk_remaining, &mut chunk_pending)
+                            chunked_decoder.feed(body_data)
                         } else {
                             body_data.to_vec()
                         };
@@ -1016,7 +990,7 @@ fn relay_and_stream(
                 } else {
                     // Subsequent chunks: just SSE body data
                     let output = if is_chunked {
-                        strip_chunked_framing(decrypted, &mut chunk_remaining, &mut chunk_pending)
+                        chunked_decoder.feed(decrypted)
                     } else {
                         decrypted.to_vec()
                     };
@@ -1188,124 +1162,10 @@ fn parse_upstream_headers(data: &[u8]) -> (u16, usize) {
     (status, body_start)
 }
 
-/// Decode `Transfer-Encoding: chunked` framing from raw bytes.
-///
-/// Uses a proper stateful chunked decoder that tracks expected chunk sizes,
-/// instead of the old heuristic that stripped any all-hex line.  The old
-/// approach would corrupt data when SSE content contained lines with only
-/// hex characters (e.g. code snippets like "abcdef", "face", "0000").
-///
-/// `chunk_remaining` tracks how many bytes of chunk data are still expected
-/// from a previous call (data may be split across relay rounds).
-///
-/// If parsing fails at any point, returns the raw data unchanged as a safe
-/// fallback — better to pass through framing artifacts than to corrupt content.
-fn strip_chunked_framing(
-    data: &[u8],
-    chunk_remaining: &mut usize,
-    pending: &mut Vec<u8>,
-) -> Vec<u8> {
-    pending.extend_from_slice(data);
-
-    let mut result = Vec::with_capacity(pending.len());
-    let mut pos = 0;
-
-    while pos < pending.len() {
-        if *chunk_remaining > 0 {
-            // We're in the middle of a chunk — consume up to chunk_remaining bytes
-            let available = pending.len() - pos;
-            let to_copy = available.min(*chunk_remaining);
-            result.extend_from_slice(&pending[pos..pos + to_copy]);
-            pos += to_copy;
-            *chunk_remaining -= to_copy;
-
-            // If we've consumed the full chunk, we must have trailing \r\n.
-            // If not available yet, wait for more bytes in the next round.
-            if *chunk_remaining == 0 {
-                if pos + 2 > pending.len() {
-                    break;
-                }
-                if &pending[pos..pos + 2] == b"\r\n" {
-                    pos += 2;
-                } else {
-                    debug!("chunked decode: missing chunk CRLF, falling back to raw");
-                    let raw = pending.split_off(0);
-                    return raw;
-                }
-            }
-            continue;
-        }
-
-        // Expecting a chunk size line: hex digits followed by \r\n
-        let line_end = match pending[pos..].windows(2).position(|w| w == b"\r\n") {
-            Some(p) => pos + p,
-            None => {
-                // No complete line — partial chunk-size line, keep in pending.
-                break;
-            }
-        };
-
-        let line = &pending[pos..line_end];
-
-        // Parse hex chunk size (ignore chunk extensions after ';')
-        let hex_str = match std::str::from_utf8(line) {
-            Ok(s) => s.split(';').next().unwrap_or("").trim(),
-            Err(_) => {
-                // Not valid UTF-8 — not a chunk size line.  Fall back to raw passthrough.
-                warn!("chunked decode: non-UTF8 at pos {pos}, falling back to raw");
-                let raw = pending.split_off(0);
-                return raw;
-            }
-        };
-
-        if hex_str.is_empty() {
-            // Empty line between chunks — skip
-            pos = line_end + 2;
-            continue;
-        }
-
-        let chunk_size = match usize::from_str_radix(hex_str, 16) {
-            Ok(size) => size,
-            Err(_) => {
-                // Not a valid hex size — this data isn't actually chunked, or we've
-                // lost sync.  Return raw data as fallback.
-                debug!("chunked decode: invalid hex '{}' at pos {pos}, falling back to raw", hex_str);
-                let raw = pending.split_off(0);
-                return raw;
-            }
-        };
-
-        // Skip past the chunk size line + \r\n
-        pos = line_end + 2;
-
-        if chunk_size == 0 {
-            // Terminal chunk — skip optional trailers and final \r\n
-            // Keep parser simple: stop consuming here; any trailers stay in pending.
-            break;
-        }
-
-        // Read chunk data
-        let available = pending.len() - pos;
-        let to_copy = available.min(chunk_size);
-        result.extend_from_slice(&pending[pos..pos + to_copy]);
-        pos += to_copy;
-
-        if to_copy < chunk_size {
-            // Chunk spans into the next relay round
-            *chunk_remaining = chunk_size - to_copy;
-        } else {
-            // Full chunk consumed — skip trailing \r\n
-            if pos + 2 <= pending.len() && &pending[pos..pos + 2] == b"\r\n" {
-                pos += 2;
-            }
-        }
-    }
-
-    if pos > 0 {
-        pending.drain(0..pos);
-    }
-    result
-}
+// `strip_chunked_framing` was moved to `crate::http::chunked::ChunkedDecoder` in
+// Step 2 of the refactor. The stateful decoder is now a proper struct with
+// unit-testable feed() method; behavior (including Lenient fallback on parse
+// failure) is preserved exactly.
 
 /// Send an HTTP error response to the client.
 fn send_error(client: &mut TcpStream, status: u16, message: &str) {
