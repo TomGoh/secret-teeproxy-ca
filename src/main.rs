@@ -22,6 +22,7 @@
 mod constants;
 mod error;
 mod http;
+mod relay;
 mod server;
 mod serve;
 mod sse;
