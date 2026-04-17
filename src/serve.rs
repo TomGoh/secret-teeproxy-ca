@@ -198,26 +198,11 @@ fn send_json_response(client: &mut TcpStream, status: u16, status_text: &str, js
     let _ = client.write_all(response.as_bytes());
 }
 
-/// Validate `X-Admin-Token` against `SECRET_PROXY_CA_ADMIN_TOKEN`. If env is unset/empty, admin is disabled.
-fn check_admin_token(headers_block: &str) -> Result<(), &'static str> {
-    let expected = match std::env::var(ADMIN_TOKEN_ENV) {
-        Ok(t) if !t.is_empty() => t,
-        _ => return Err("admin API disabled (set SECRET_PROXY_CA_ADMIN_TOKEN)"),
-    };
-    let expected_prev = std::env::var(ADMIN_TOKEN_PREV_ENV)
-        .ok()
-        .filter(|t| !t.is_empty());
-    let provided = header_value(headers_block, "x-admin-token").unwrap_or_default();
-    let current_match = constant_time_equal(&provided, &expected);
-    let previous_match = expected_prev
-        .as_ref()
-        .map(|prev| constant_time_equal(&provided, prev))
-        .unwrap_or(false);
-    if !(current_match || previous_match) {
-        return Err("invalid admin token");
-    }
-    Ok(())
-}
+// `check_admin_token` moved to `crate::server::admin` in Step 4.
+// Behavior identical (same env var names, same rotation window, same
+// constant-time compare) but now takes an injectable EnvSource for
+// unit tests without polluting the process environment.
+use crate::server::admin::check_admin_token;
 
 #[derive(Deserialize)]
 struct AdminProvisionBody {

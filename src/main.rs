@@ -20,6 +20,7 @@
 mod constants;
 mod error;
 mod http;
+mod server;
 mod serve;
 
 // Re-export constants at the crate root so existing `crate::TA_UUID` imports
