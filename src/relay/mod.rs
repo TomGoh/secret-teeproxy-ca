@@ -18,3 +18,5 @@
 //! for the migration trajectory.
 
 pub mod core;
+pub mod session;
+pub mod upstream;

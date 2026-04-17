@@ -22,7 +22,7 @@
 //!   → OpenClaw receives Anthropic SSE events in real-time
 //! ```
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Write};
 use std::mem;
 use std::net::{TcpListener, TcpStream};
 
@@ -38,13 +38,17 @@ use crate::{
     ta_error_layer, teec_list_slots, teec_list_slots_meta, teec_provision_key, teec_remove_key,
     ProvisionKeyPayload,
     SlotEntry,
-    TA_UUID, CMD_PROXY_REQUEST, CMD_RELAY_DATA,
-    BIZ_RELAY_START, BIZ_RELAY_CONTINUE, BIZ_RELAY_DONE, BIZ_RELAY_STREAMING,
+    TA_UUID, CMD_PROXY_REQUEST,
+    BIZ_RELAY_START,
     HttpMethod, ProxyRequest,
     // Admin-API constants (moved to crate::constants in Step 1 refactor,
     // re-exported at crate root — see main.rs top).
     // ADMIN_TOKEN_MIN_LEN migrated with `validate_admin_token_strength` to
     // `crate::http::headers` in Step 2, so no longer imported here.
+    // Step 7b refactor: CMD_RELAY_DATA + BIZ_RELAY_{CONTINUE,DONE,STREAMING}
+    // imports removed — they're only used inside `relay::{core,session}`
+    // now. BIZ_RELAY_START stays because `handle_proxy_post` still checks
+    // it as the expected response from CMD_PROXY_REQUEST.
     ADMIN_TOKEN_ENV, ADMIN_TOKEN_PREV_ENV,
     ADMIN_ACTOR_HEADER, ADMIN_REQUEST_ID_HEADER,
 };
@@ -148,7 +152,8 @@ pub fn cmd_serve(args: &[String]) -> Result<(), String> {
 // directly in serve.rs. `header_value` is still used by `admin_audit_context`;
 // `validate_admin_token_strength` is used by the startup env validation.
 use crate::http::headers::{header_value, validate_admin_token_strength};
-use crate::http::chunked::ChunkedDecoder;
+// Step 7b refactor: ChunkedDecoder moved inside the relay state machine
+// (`crate::relay::core::RelayState`); serve.rs no longer manages one directly.
 
 fn admin_audit_context(headers_block: &str, client: &TcpStream) -> AdminAuditContext {
     let actor = header_value(headers_block, ADMIN_ACTOR_HEADER).unwrap_or_else(|| "unknown".into());
@@ -725,323 +730,41 @@ fn handle_proxy_post(
 ///   the LLM server (hex length prefixes like `19d\r\n`).  We strip these since
 ///   the CA→OpenClaw connection uses its own framing.
 /// - On `BIZ_RELAY_DONE`: flush and close.
+/// Step 7b refactor: the 265-line inline loop (TA invoke + dispatch +
+/// client/upstream I/O) is now the `relay::session::run_relay_loop`
+/// adapter driving the `relay::core` pure state machine. This wrapper
+/// keeps the original signature and handles the two concerns that
+/// stay here: disabling Nagle on the client socket (so SSE events
+/// push without kernel batching) and establishing the upstream TCP
+/// connection.
 fn relay_and_stream(
     teec: &mut dyn Teec,
     target: &str,
     initial_tls: &[u8],
     client: &mut TcpStream,
 ) -> Result<(), String> {
-    // Disable Nagle on the client connection so SSE events are pushed
-    // immediately instead of being batched by the kernel.
+    // TCP_NODELAY preserved from pre-refactor serve.rs:836. Load-
+    // bearing for SSE UX — without it the kernel batches 40-byte
+    // `data: ...\n\n` lines and openclaw's token-by-token rendering
+    // stalls until the next full MTU worth of bytes accumulates.
     let _ = client.set_nodelay(true);
 
-    // TCP connect to LLM API server
-    let mut tcp = TcpStream::connect(target)
+    // Upstream connect moved into TcpUpstream::connect (sets the same
+    // 120s read timeout the pre-refactor code used).
+    let mut upstream = crate::relay::upstream::TcpUpstream::connect(target)
         .map_err(|e| format!("TCP connect to {target}: {e}"))?;
-    tcp.set_read_timeout(Some(std::time::Duration::from_secs(120)))
-        .map_err(|e| format!("set_read_timeout: {e}"))?;
 
-    debug!("sending {} bytes ClientHello to {target}", initial_tls.len());
-    tcp.write_all(initial_tls)
-        .map_err(|e| format!("TCP write ClientHello: {e}"))?;
-
-    let mut read_buf = vec![0u8; 65536];
-    let mut response_buf = vec![0u8; 1024 * 1024];
-    let mut tls_extra_buf = vec![0u8; 4096];
-    let mut saw_eof = false;
-    let mut response_started = false;
-    let mut round = 0u32;
-    // Track whether upstream uses chunked encoding (detected from response headers)
-    let mut is_chunked = false;
-    // Chunked decoder (stateful across relay rounds — carries partial chunks
-    // and partial size lines between TA roundtrips).
-    // Step 2 refactor: replaced the prior pair of `chunk_remaining` / `chunk_pending`
-    // locals with a single struct that encapsulates both. Behavior identical
-    // (Lenient fallback: parse failure dumps pending buffer as raw).
-    let mut chunked_decoder = ChunkedDecoder::new();
-
-    loop {
-        round += 1;
-        debug!("relay round {round}, reading from TCP...");
-        let n = match tcp.read(&mut read_buf) {
-            Ok(n) => n,
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::TimedOut
-                    || e.kind() == std::io::ErrorKind::WouldBlock =>
-            {
-                send_error(client, 504, "upstream timeout");
-                return Err("TCP read timed out".into());
-            }
-            Err(e) => {
-                if !response_started {
-                    send_error(client, 502, &format!("TCP read: {e}"));
-                }
-                return Err(format!("TCP read: {e}"));
-            }
-        };
-
-        if n == 0 {
-            if saw_eof {
-                return Err("server closed before relay completed".into());
-            }
-            saw_eof = true;
-        } else {
-            saw_eof = false;
-        }
-
-        debug!("relay round {round}, server→ {n} bytes{}", if n == 0 { " (EOF)" } else { "" });
-
-        // Send ciphertext to TA via CMD_RELAY_DATA
-        let mut server_data = read_buf[..n].to_vec();
-        let mut op: raw::TEEC_Operation = unsafe { mem::zeroed() };
-        op.paramTypes = raw::TEEC_PARAM_TYPES(
-            raw::TEEC_MEMREF_TEMP_INPUT,
-            raw::TEEC_VALUE_INOUT,
-            raw::TEEC_MEMREF_TEMP_OUTPUT,
-            raw::TEEC_MEMREF_TEMP_OUTPUT,
-        );
-        op.params[0].tmpref.buffer = server_data.as_mut_ptr() as *mut _;
-        op.params[0].tmpref.size = server_data.len();
-        // Param 1 input: a=1 only when upstream TCP read returned EOF (n==0).
-        // Distinguishes that from empty ciphertext used to pump rustls (see below).
-        op.params[1].value.a = if n == 0 { 1 } else { 0 };
-        op.params[1].value.b = 0;
-        op.params[2].tmpref.buffer = response_buf.as_mut_ptr() as *mut _;
-        op.params[2].tmpref.size = response_buf.len();
-        op.params[3].tmpref.buffer = tls_extra_buf.as_mut_ptr() as *mut _;
-        op.params[3].tmpref.size = tls_extra_buf.len();
-
-        let (rc, origin) = teec.invoke(CMD_RELAY_DATA, &mut op);
-        if let Err(e) = check_teec_rc(rc, origin) {
-            if !response_started {
-                send_error(client, 502, &e);
-            }
-            return Err(e);
-        }
-
-        let (status, _detail) = unsafe { (op.params[1].value.a, op.params[1].value.b) };
-        let filled = unsafe { op.params[2].tmpref.size };
-        let tls_extra_filled = unsafe { op.params[3].tmpref.size };
-
-        debug!("relay round {round}, TA status=0x{status:04x}, params[2]={filled} bytes, params[3]={tls_extra_filled} bytes");
-
-        match status {
-            BIZ_RELAY_CONTINUE => {
-                if filled > 0 {
-                    // TLS handshake — send outgoing bytes to server
-                    debug!("relay round {round}, →server {filled} bytes (handshake)");
-                    tcp.write_all(&response_buf[..filled])
-                        .map_err(|e| format!("TCP write TLS: {e}"))?;
-                } else {
-                    // TA consumed data but produced no outgoing bytes yet.
-                    // Pump the state machine with empty input — rustls may
-                    // have pending write_tls data after processing multiple
-                    // TLS records across separate process_relay calls.
-                    debug!("relay round {round}, pumping TA (0 outgoing, calling relay with empty)");
-                    let mut empty = Vec::new();
-                    let mut op2: raw::TEEC_Operation = unsafe { mem::zeroed() };
-                    op2.paramTypes = raw::TEEC_PARAM_TYPES(
-                        raw::TEEC_MEMREF_TEMP_INPUT,
-                        raw::TEEC_VALUE_INOUT,
-                        raw::TEEC_MEMREF_TEMP_OUTPUT,
-                        raw::TEEC_MEMREF_TEMP_OUTPUT,
-                    );
-                    op2.params[0].tmpref.buffer = empty.as_mut_ptr() as *mut _;
-                    op2.params[0].tmpref.size = 0;
-                    op2.params[1].value.a = 0;
-                    op2.params[1].value.b = 0;
-                    op2.params[2].tmpref.buffer = response_buf.as_mut_ptr() as *mut _;
-                    op2.params[2].tmpref.size = response_buf.len();
-                    op2.params[3].tmpref.buffer = tls_extra_buf.as_mut_ptr() as *mut _;
-                    op2.params[3].tmpref.size = tls_extra_buf.len();
-
-                    let (rc2, origin2) = teec.invoke(CMD_RELAY_DATA, &mut op2);
-                    if let Err(e) = check_teec_rc(rc2, origin2) {
-                        if !response_started { send_error(client, 502, &e); }
-                        return Err(e);
-                    }
-                    let pump_filled = unsafe { op2.params[2].tmpref.size };
-                    if pump_filled > 0 {
-                        debug!("relay round {round}, pump produced {pump_filled} bytes, →server");
-                        tcp.write_all(&response_buf[..pump_filled])
-                            .map_err(|e| format!("TCP write TLS (pump): {e}"))?;
-                    }
-                }
-            }
-
-            BIZ_RELAY_STREAMING => {
-                let decrypted = &response_buf[..filled];
-
-                if !response_started {
-                    // First streaming chunk: contains HTTP headers + initial body.
-                    // Extract the LLM server's HTTP status and start our response.
-                    let (http_status, body_start) = parse_upstream_headers(decrypted);
-
-                    // Detect chunked transfer encoding from upstream headers
-                    let header_bytes = &decrypted[..body_start.saturating_sub(4).min(decrypted.len())];
-                    if let Ok(hdr) = std::str::from_utf8(header_bytes) {
-                        info!("┌─ UPSTREAM RESPONSE ────────────────────");
-                        for line in hdr.lines().take(10) {
-                            info!("│ {line}");
-                            if line.to_lowercase().contains("transfer-encoding")
-                                && line.to_lowercase().contains("chunked")
-                            {
-                                is_chunked = true;
-                            }
-                        }
-                        info!("└───────────────────────────────────────");
-                    }
-                    debug!("upstream chunked encoding: {is_chunked}");
-
-                    // Write HTTP response headers to OpenClaw client.
-                    // Step 6 refactor: header assembly moved to
-                    // `crate::sse::encoder::sse_response_headers`; bytes
-                    // byte-for-byte identical, regression-pinned by the
-                    // `preamble_exact_bytes` unit test.
-                    let response_headers = crate::sse::encoder::sse_response_headers(http_status);
-                    client.write_all(&response_headers)
-                        .map_err(|e| format!("client write headers: {e}"))?;
-                    response_started = true;
-
-                    // Write initial body data (SSE events after the upstream headers)
-                    if body_start < decrypted.len() {
-                        let body_data = &decrypted[body_start..];
-                        let output = if is_chunked {
-                            chunked_decoder.feed(body_data)
-                        } else {
-                            body_data.to_vec()
-                        };
-                        log_sse_content(&output);
-                        client.write_all(&output)
-                            .map_err(|e| format!("client write initial body: {e}"))?;
-                        client.flush().map_err(|e| format!("client flush: {e}"))?;
-                    }
-                } else {
-                    // Subsequent chunks: just SSE body data
-                    let output = if is_chunked {
-                        chunked_decoder.feed(decrypted)
-                    } else {
-                        decrypted.to_vec()
-                    };
-                    log_sse_content(&output);
-                    client.write_all(&output)
-                        .map_err(|e| format!("client write SSE: {e}"))?;
-                    client.flush().map_err(|e| format!("client flush: {e}"))?;
-                }
-
-                // Send any TLS bytes back to server
-                let tls_len = unsafe { op.params[3].tmpref.size };
-                if tls_len > 0 {
-                    tcp.write_all(&tls_extra_buf[..tls_len])
-                        .map_err(|e| format!("TCP write TLS: {e}"))?;
-                }
-            }
-
-            BIZ_RELAY_DONE => {
-                // Send final TLS bytes (e.g. close_notify)
-                let tls_len = unsafe { op.params[3].tmpref.size };
-                if tls_len > 0 {
-                    let _ = tcp.write_all(&tls_extra_buf[..tls_len]);
-                }
-
-                if !response_started && filled > 0 {
-                    // The TA completed the relay in a single round — the
-                    // decrypted data is a ProxyResponse JSON (not raw HTTP).
-                    // Parse it and forward the body with the correct
-                    // content-type so the Anthropic SDK's SSE parser works.
-                    let decrypted = &response_buf[..filled];
-                    let resp: crate::ProxyResponse = serde_json::from_slice(decrypted)
-                        .map_err(|e| format!("parse ProxyResponse: {e}"))?;
-
-                    let content_type = resp.headers.get("content-type")
-                        .map(|s| s.as_str())
-                        .unwrap_or("application/json");
-                    let response_headers = format!(
-                        "HTTP/1.1 {} OK\r\n\
-                         Content-Type: {content_type}\r\n\
-                         Content-Length: {}\r\n\
-                         Connection: close\r\n\
-                         \r\n",
-                        resp.status, resp.body.len()
-                    );
-                    log_sse_content(&resp.body);
-                    client.write_all(response_headers.as_bytes())
-                        .map_err(|e| format!("client write headers: {e}"))?;
-                    client.write_all(&resp.body)
-                        .map_err(|e| format!("client write body: {e}"))?;
-                }
-
-                let _ = client.flush();
-                info!("serve → stream complete");
-                return Ok(());
-            }
-
-            _ => {
-                let msg = format!("relay error: 0x{status:04x}");
-                if !response_started {
-                    send_error(client, 502, &msg);
-                }
-                return Err(msg);
-            }
-        }
-    }
+    info!("serve relay → {target}");
+    crate::relay::session::run_relay_loop(teec, &mut upstream, client, initial_tls)
 }
 
-/// Log Anthropic-format SSE events so the operator can tail the daemon
-/// log and see the LLM's actual words in real time.
-///
-/// Step 6 refactor: the 60-line inline event parser moved into
-/// `crate::sse::parser::parse_events` (pure, unit-testable) and the
-/// logging side-effect into `sse::parser::log_event`. This wrapper is
-/// the one remaining call site in serve.rs; keep it trivially thin.
-fn log_sse_content(data: &[u8]) {
-    for ev in crate::sse::parser::parse_events(data) {
-        crate::sse::parser::log_event(&ev);
-    }
-}
-
-/// Parse the HTTP status code and find the body start from upstream response headers.
-///
-/// The first `BIZ_RELAY_STREAMING` chunk contains the full HTTP response headers
-/// from the LLM server followed by `\r\n\r\n` and the start of SSE body.
-///
-/// # Returns
-/// `(http_status_code, byte_offset_of_body_start)`
-fn parse_upstream_headers(data: &[u8]) -> (u16, usize) {
-    // Find \r\n\r\n boundary
-    let boundary = data
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .unwrap_or(data.len());
-
-    // Parse status from first line: "HTTP/1.1 200 OK"
-    let header_str = String::from_utf8_lossy(&data[..boundary]);
-    let status = header_str
-        .lines()
-        .next()
-        .and_then(|line| {
-            let parts: Vec<&str> = line.splitn(3, ' ').collect();
-            if parts.len() >= 2 {
-                parts[1].parse::<u16>().ok()
-            } else {
-                None
-            }
-        })
-        .unwrap_or(200);
-
-    let body_start = if boundary + 4 <= data.len() {
-        boundary + 4
-    } else {
-        data.len()
-    };
-
-    (status, body_start)
-}
-
-// `strip_chunked_framing` was moved to `crate::http::chunked::ChunkedDecoder` in
-// Step 2 of the refactor. The stateful decoder is now a proper struct with
-// unit-testable feed() method; behavior (including Lenient fallback on parse
-// failure) is preserved exactly.
+// Step 7b refactor: `log_sse_content`, `parse_upstream_headers`, and the
+// `strip_chunked_framing`/`ChunkedDecoder` helpers all moved into the
+// relay subtree — `log_sse_content` became
+// `crate::relay::session::log_decoded_events`, `parse_upstream_headers`
+// became a private helper inside `crate::relay::core`, and
+// `ChunkedDecoder` was already in `crate::http::chunked` and is now
+// owned by `RelayState`.
 
 /// Send an HTTP error response to the client.
 fn send_error(client: &mut TcpStream, status: u16, message: &str) {
