@@ -5,7 +5,7 @@
 //! max-connections from the Phase-2 plan) land in a predictable place
 //! instead of growing `cmd_serve`'s argument spaghetti.
 
-use crate::parse_arg_u32;
+use crate::cli::parse_arg_u32;
 
 /// Parsed serve-mode arguments.
 #[derive(Debug, Clone)]

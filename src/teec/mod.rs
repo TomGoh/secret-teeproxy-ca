@@ -31,6 +31,7 @@
 //! records produced by `MockTeec`. See `teec::mock::tests` and the
 //! param-layout tests in `main.rs` for examples.
 
+pub mod ops;
 pub mod real;
 
 #[cfg(any(test, feature = "test-support"))]
