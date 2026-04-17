@@ -162,12 +162,11 @@ pub fn cmd_serve(args: &[String]) -> Result<(), String> {
 }
 
 // Pure header / token helpers moved to `crate::http::headers` in Step 2.
-// `validate_admin_token_strength` now returns `Result<(), &'static str>` —
-// the existing `.map_err(|e| format!("... {e}"))` call sites compose the same
-// way since both `&str` and `String` implement `Display`.
-use crate::http::headers::{
-    constant_time_equal, header_value, normalize_http_path, validate_admin_token_strength,
-};
+// After Step 4 `check_admin_token` moved to `crate::server::admin`, so
+// `constant_time_equal` and `normalize_http_path` are no longer needed
+// directly in serve.rs. `header_value` is still used by `admin_audit_context`;
+// `validate_admin_token_strength` is used by the startup env validation.
+use crate::http::headers::{header_value, validate_admin_token_strength};
 use crate::http::chunked::ChunkedDecoder;
 
 fn admin_audit_context(headers_block: &str, client: &TcpStream) -> AdminAuditContext {

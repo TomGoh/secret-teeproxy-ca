@@ -14,8 +14,10 @@
 //!   secret_proxy_ca provision-key --slot <N> --key <sk-...> --provider <minimax|moonshot>
 //!   secret_proxy_ca remove-key --slot <N>
 //!   secret_proxy_ca add-whitelist --pattern <url-prefix>
-//!   secret_proxy_ca proxy --slot <N> --url <https://...> --body <json>
 //!   secret_proxy_ca serve [--port 18800]
+//!
+//! Note: the `proxy` CLI subcommand was removed in the Step 8 refactor
+//! (verified no external callers — openclaw uses `serve` mode's HTTP API).
 
 mod constants;
 mod error;
@@ -40,14 +42,15 @@ pub(crate) use constants::{
 };
 
 use std::{collections::HashMap, mem};
-use std::io::{Read, Write};
-use std::net::TcpStream;
+// Step 8 refactor: `Read`, `Write`, `TcpStream`, `debug`, `info` were only
+// used by the removed `cmd_proxy` + `relay_loop`; pruned here. The logging
+// crate `log::error` macro is still needed by the main entry point.
 
 use cc_teec::{
     TEEC_CloseSession, TEEC_FinalizeContext, TEEC_InitializeContext, TEEC_InvokeCommand,
     TEEC_OpenSession, raw,
 };
-use log::{info, debug, error};
+use log::error;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -265,12 +268,16 @@ fn run() -> Result<(), String> {
         return Err(format!("TEEC_OpenSession failed: 0x{rc:08x}, origin={origin}"));
     }
 
+    // Step 8 refactor (2026-04-17): the `proxy` CLI subcommand and its
+    // 185-LOC companion `relay_loop` were removed. Verified via grep that
+    // nothing outside this crate invoked `secret_proxy_ca proxy` —
+    // openclaw uses the HTTP `serve` mode directly, and no shell script
+    // or deploy script referenced the CLI path.
     let result = match args[1].as_str() {
         "list-slots"     => cmd_list_slots(&mut session),
         "provision-key"  => cmd_provision_key(&mut session, &args[2..]),
         "remove-key"     => cmd_remove_key(&mut session, &args[2..]),
         "add-whitelist"  => cmd_add_whitelist(&mut session, &args[2..]),
-        "proxy"          => cmd_proxy(&mut session, &args[2..]),
         other => {
             error!("unknown command: {other}");
             print_usage(&args[0]);
@@ -505,273 +512,6 @@ fn cmd_add_whitelist(session: &mut raw::TEEC_Session, args: &[String]) -> Result
 /// # Logic
 /// 1. Parse CLI arguments: `--slot`, `--url`, `--body`, `--method`, `--stream`.
 /// 2. Build a `ProxyRequest` JSON and send via `TEEC_InvokeCommand(CMD_PROXY_REQUEST)`.
-/// 3. Check the response:
-///    - `BIZ_RELAY_START`: TA created a relay session.  Extract the target
-///      "host:port" from `params[2]` and initial TLS bytes from `params[3]`.
-///      Enter [`relay_loop`] to drive the TCP + TEEC relay cycle.
-///    - `BIZ_SUCCESS`: legacy mode (vsock-forwarder/direct-http).  The TA
-///      returned the full ProxyResponse directly in `params[2]`.
-///    - `BIZ_ERR_*`: validation failure (whitelist, key not found, bad JSON).
-///
-/// # Arguments
-/// * `session` - open TEEC session to the TA
-/// * `args` - CLI argument slice after the "proxy" subcommand
-///
-/// # Returns
-/// `Ok(())` on success (response printed to stdout), `Err(String)` on failure.
-fn cmd_proxy(session: &mut raw::TEEC_Session, args: &[String]) -> Result<(), String> {
-    let slot = parse_arg_u32(args, "--slot")?;
-    let url = parse_arg_str(args, "--url")?;
-    let body_str = parse_arg_str(args, "--body")?;
-    let method_str = parse_arg_str(args, "--method").unwrap_or_else(|_| "Post".into());
-    let stream_mode = args.iter().any(|a| a == "--stream");
-
-    let method = match method_str.as_str() {
-        "Get"    => HttpMethod::Get,
-        "Post"   => HttpMethod::Post,
-        "Put"    => HttpMethod::Put,
-        "Delete" => HttpMethod::Delete,
-        "Patch"  => HttpMethod::Patch,
-        other    => return Err(format!("unknown method: {other}")),
-    };
-
-    let mut headers = HashMap::from([("Content-Type".into(), "application/json".into())]);
-    // Anthropic-compatible endpoints require this version header
-    if url.contains("/anthropic/") {
-        headers.insert("anthropic-version".into(), "2023-06-01".into());
-    }
-
-    let req = ProxyRequest {
-        key_id: slot,
-        endpoint_url: url,
-        method,
-        headers,
-        body: body_str.into_bytes(),
-        body_base64: None,
-    };
-    let mut json = serde_json::to_vec(&req).map_err(|e| format!("serialize error: {e}"))?;
-
-    // --- Step 1: CMD_PROXY_REQUEST → get relay start or legacy response ---
-    // params[0] MemrefInput:  JSON ProxyRequest
-    // params[1] ValueOutput:  {a: biz_code, b: detail}
-    // params[2] MemrefOutput: target host:port (relay) or ProxyResponse JSON (legacy)
-    // params[3] MemrefOutput: initial TLS bytes (relay only)
-    let mut target_buf = vec![0u8; 1024];
-    let mut tls_buf = vec![0u8; 16384];
-    let mut op: raw::TEEC_Operation = unsafe { mem::zeroed() };
-    op.paramTypes = raw::TEEC_PARAM_TYPES(
-        raw::TEEC_MEMREF_TEMP_INPUT,
-        raw::TEEC_VALUE_OUTPUT,
-        raw::TEEC_MEMREF_TEMP_OUTPUT,
-        raw::TEEC_MEMREF_TEMP_OUTPUT,
-    );
-    op.params[0].tmpref.buffer = json.as_mut_ptr() as *mut _;
-    op.params[0].tmpref.size = json.len();
-    op.params[2].tmpref.buffer = target_buf.as_mut_ptr() as *mut _;
-    op.params[2].tmpref.size = target_buf.len();
-    op.params[3].tmpref.buffer = tls_buf.as_mut_ptr() as *mut _;
-    op.params[3].tmpref.size = tls_buf.len();
-
-    let mut origin = 0u32;
-    let rc = TEEC_InvokeCommand(session, CMD_PROXY_REQUEST, &mut op, &mut origin);
-    check_teec_rc(rc, origin)?;
-
-    let biz_code = unsafe { op.params[1].value.a };
-
-    if biz_code == BIZ_RELAY_START {
-        // --- Relay mode: CA handles TCP I/O ---
-        let target_len = unsafe { op.params[2].tmpref.size };
-        let target = std::str::from_utf8(&target_buf[..target_len])
-            .map_err(|e| format!("invalid target UTF-8: {e}"))?
-            .to_string();
-        let tls_len = unsafe { op.params[3].tmpref.size };
-        let initial_tls = &tls_buf[..tls_len];
-
-        info!("relay mode → TCP connect to {target}");
-
-        return relay_loop(session, &target, initial_tls, stream_mode);
-    }
-
-    // --- Legacy mode: TA returned the final result directly ---
-    check_biz_code(biz_code)?;
-
-    let http_status = unsafe { op.params[1].value.b };
-    let filled = unsafe { op.params[2].tmpref.size };
-    let resp: ProxyResponse = serde_json::from_slice(&target_buf[..filled])
-        .map_err(|e| format!("failed to parse ProxyResponse: {e}"))?;
-
-    println!("HTTP {http_status}");
-    if let Ok(s) = std::str::from_utf8(&resp.body) {
-        println!("{s}");
-    } else {
-        println!("<{} bytes binary>", resp.body.len());
-    }
-    Ok(())
-}
-
-/// Relay loop: the CA drives TCP I/O while the TA drives the TLS state machine.
-///
-/// # Logic
-/// 1. `TcpStream::connect(target)` to the API server (e.g. api.minimax.chat:443).
-///    Set a 30-second read timeout.
-/// 2. Send initial TLS bytes (ClientHello from CMD_PROXY_REQUEST) to the server.
-/// 3. Enter the relay loop.  Each iteration:
-///    a. Read ciphertext from the TCP socket (server → CA).
-///    b. Send it to the TA via `TEEC_InvokeCommand(CMD_RELAY_DATA)`.
-///    c. Process the TA's response based on the business status code:
-///       - `BIZ_RELAY_CONTINUE`: send `params[2]` TLS bytes to the server.
-///         (TLS handshake continuation or encrypted HTTP request.)
-///       - `BIZ_RELAY_STREAMING`: TA has decrypted SSE plaintext.  If
-///         `stream_mode`, write `params[2]` to stdout and flush immediately.
-///         Send any `params[3]` TLS bytes to the server.
-///       - `BIZ_RELAY_DONE`: relay complete.  In `stream_mode`, all data was
-///         already written to stdout — just send final TLS bytes and return.
-///         In non-stream mode, parse `params[2]` as ProxyResponse JSON and
-///         print as `HTTP {status}\n{body}`.
-///       - `BIZ_ERR_TRANSPORT`: TA reported a TLS/connection error.
-/// 4. EOF detection: if `tcp.read()` returns 0 twice consecutively, the server
-///    closed the connection before the TA completed — return an error to
-///    prevent infinite looping.
-///
-/// # Arguments
-/// * `session` - open TEEC session to the TA
-/// * `target` - "host:port" string from CMD_PROXY_REQUEST response
-/// * `initial_tls` - ClientHello bytes from CMD_PROXY_REQUEST response
-/// * `stream_mode` - if true, write decrypted plaintext to stdout progressively
-///
-/// # Returns
-/// `Ok(())` on success, `Err(String)` on TCP/TEEC failure.
-fn relay_loop(
-    session: &mut raw::TEEC_Session,
-    target: &str,
-    initial_tls: &[u8],
-    stream_mode: bool,
-) -> Result<(), String> {
-    // 1. TCP connect to the target API server
-    let mut tcp = TcpStream::connect(target)
-        .map_err(|e| format!("TCP connect to {target} failed: {e}"))?;
-    tcp.set_read_timeout(Some(std::time::Duration::from_secs(120)))
-        .map_err(|e| format!("set_read_timeout: {e}"))?;
-
-    // 2. Send initial TLS bytes (ClientHello)
-    tcp.write_all(initial_tls)
-        .map_err(|e| format!("TCP write initial TLS failed: {e}"))?;
-
-    // 3. Relay loop — reuse buffers across rounds to avoid repeated allocation
-    let mut read_buf = vec![0u8; 65536];
-    let mut response_buf = vec![0u8; 1024 * 1024]; // 1 MiB for TA output
-    let mut tls_final_buf = vec![0u8; 4096]; // for final TLS bytes on DONE
-    let mut round = 0u32;
-    let mut saw_eof = false;
-
-    loop {
-        round += 1;
-
-        // Read from TCP server
-        let n = match tcp.read(&mut read_buf) {
-            Ok(n) => n,
-            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut
-                       || e.kind() == std::io::ErrorKind::WouldBlock => {
-                return Err("TCP read timed out waiting for server".into());
-            }
-            Err(e) => return Err(format!("TCP read failed: {e}")),
-        };
-
-        if n == 0 {
-            if saw_eof {
-                // Second consecutive EOF → server closed, TA didn't finish
-                return Err("server closed connection before TA completed relay".into());
-            }
-            saw_eof = true;
-        } else {
-            saw_eof = false;
-        }
-
-        debug!("relay round {round}, server→ {n} bytes{}", if n == 0 { " (EOF)" } else { "" });
-
-        // Send server data to TA via CMD_RELAY_DATA
-        let mut server_data = read_buf[..n].to_vec();
-        let mut op: raw::TEEC_Operation = unsafe { mem::zeroed() };
-        op.paramTypes = raw::TEEC_PARAM_TYPES(
-            raw::TEEC_MEMREF_TEMP_INPUT,
-            raw::TEEC_VALUE_INOUT,
-            raw::TEEC_MEMREF_TEMP_OUTPUT,
-            raw::TEEC_MEMREF_TEMP_OUTPUT,
-        );
-        op.params[0].tmpref.buffer = server_data.as_mut_ptr() as *mut _;
-        op.params[0].tmpref.size = server_data.len();
-        op.params[1].value.a = if n == 0 { 1 } else { 0 };
-        op.params[1].value.b = 0;
-        op.params[2].tmpref.buffer = response_buf.as_mut_ptr() as *mut _;
-        op.params[2].tmpref.size = response_buf.len();
-        op.params[3].tmpref.buffer = tls_final_buf.as_mut_ptr() as *mut _;
-        op.params[3].tmpref.size = tls_final_buf.len();
-
-        let mut origin = 0u32;
-        let rc = TEEC_InvokeCommand(session, CMD_RELAY_DATA, &mut op, &mut origin);
-        check_teec_rc(rc, origin)?;
-
-        let (status, detail) = unsafe { (op.params[1].value.a, op.params[1].value.b) };
-        let filled = unsafe { op.params[2].tmpref.size };
-
-        match status {
-            BIZ_RELAY_CONTINUE => {
-                // Send outgoing TLS bytes to server (if any)
-                if filled > 0 {
-                    tcp.write_all(&response_buf[..filled])
-                        .map_err(|e| format!("TCP write TLS data failed: {e}"))?;
-                    debug!("relay round {round}, →server {filled} bytes");
-                }
-            }
-            BIZ_RELAY_STREAMING => {
-                // Streaming mode: write decrypted plaintext to stdout immediately
-                if filled > 0 && stream_mode {
-                    std::io::stdout().write_all(&response_buf[..filled])
-                        .map_err(|e| format!("stdout write: {e}"))?;
-                    std::io::stdout().flush()
-                        .map_err(|e| format!("stdout flush: {e}"))?;
-                }
-
-                // Send any TLS bytes back to server
-                let tls_len = unsafe { op.params[3].tmpref.size };
-                if tls_len > 0 {
-                    tcp.write_all(&tls_final_buf[..tls_len])
-                        .map_err(|e| format!("TCP write TLS data: {e}"))?;
-                }
-            }
-            BIZ_RELAY_DONE => {
-                // Send any final TLS bytes (e.g. close_notify) before closing
-                let final_tls_len = unsafe { op.params[3].tmpref.size };
-                if final_tls_len > 0 {
-                    let _ = tcp.write_all(&tls_final_buf[..final_tls_len]);
-                }
-
-                if stream_mode {
-                    // Streaming: all data already written to stdout
-                    return Ok(());
-                }
-
-                let http_status = detail;
-                let resp: ProxyResponse = serde_json::from_slice(&response_buf[..filled])
-                    .map_err(|e| format!("failed to parse ProxyResponse: {e}"))?;
-
-                println!("HTTP {http_status}");
-                if let Ok(s) = std::str::from_utf8(&resp.body) {
-                    println!("{s}");
-                } else {
-                    println!("<{} bytes binary>", resp.body.len());
-                }
-                return Ok(());
-            }
-            BIZ_ERR_TRANSPORT => {
-                return Err(format!("TA relay error (transport): detail=0x{detail:04x}"));
-            }
-            _ => {
-                return Err(format!("unexpected relay status: 0x{status:04x}"));
-            }
-        }
-    }
-}
 
 /// Parse a UUID string (e.g. "a3f79c15-72d0-4e3a-b8d1-9f2ca3e81054") into the
 /// `TEEC_UUID` struct required by rust-libteec.
@@ -861,15 +601,14 @@ fn print_usage(prog: &str) {
     eprintln!("  {prog} provision-key --slot <N> --key <sk-...> --provider <name>");
     eprintln!("  {prog} remove-key --slot <N>");
     eprintln!("  {prog} add-whitelist --pattern <url-prefix>");
-    eprintln!("  {prog} proxy --slot <N> --url <https://...> --body <json>");
-    eprintln!("             [--method Post|Get|Put|Delete|Patch] [--stream]");
     eprintln!("  {prog} serve [--port 19030]");
     eprintln!("  {prog} dns-test <hostname>");
     eprintln!("  {prog} vsock-test <cid> [port]");
     eprintln!();
-    eprintln!("The proxy command uses TEEC relay mode: the CA handles TCP I/O to");
-    eprintln!("external APIs while the TA drives TLS encryption inside the TEE.");
-    eprintln!("No separate tls_forwarder process is needed.");
+    eprintln!("HTTP proxy requests are served only via `serve` mode (the `proxy`");
+    eprintln!("CLI subcommand was removed in the Step 8 refactor — it had no");
+    eprintln!("external callers). Clients should POST SecretProxyRequest JSON");
+    eprintln!("to the port configured with --port.");
     eprintln!();
     eprintln!("dns-test is a TEEC-free diagnostic: resolves <hostname>:443 via the");
     eprintln!("platform's getaddrinfo and prints the result. Use it on Android to");
