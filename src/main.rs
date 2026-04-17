@@ -17,7 +17,25 @@
 //!   secret_proxy_ca proxy --slot <N> --url <https://...> --body <json>
 //!   secret_proxy_ca serve [--port 18800]
 
+mod constants;
+mod error;
 mod serve;
+
+// Re-export constants at the crate root so existing `crate::TA_UUID` imports
+// (notably in serve.rs) keep compiling without churn during the refactor.
+// When the refactor finishes, these re-exports should be removed and callers
+// should import from `crate::constants::*` explicitly.
+#[allow(unused_imports)]
+pub(crate) use constants::{
+    TA_UUID,
+    CMD_PROXY_REQUEST, CMD_PROVISION_KEY, CMD_REMOVE_KEY, CMD_LIST_SLOTS,
+    CMD_ADD_WHITELIST, CMD_RELAY_DATA, CMD_LIST_SLOTS_META,
+    BIZ_SUCCESS, BIZ_RELAY_START, BIZ_RELAY_CONTINUE, BIZ_RELAY_DONE,
+    BIZ_RELAY_STREAMING, BIZ_ERR_BAD_JSON, BIZ_ERR_KEY_NOT_FOUND,
+    BIZ_ERR_FORBIDDEN, BIZ_ERR_TRANSPORT,
+    ADMIN_TOKEN_ENV, ADMIN_TOKEN_PREV_ENV, ADMIN_TOKEN_MIN_LEN,
+    ADMIN_ACTOR_HEADER, ADMIN_REQUEST_ID_HEADER,
+};
 
 use std::{collections::HashMap, mem};
 use std::io::{Read, Write};
@@ -30,35 +48,6 @@ use cc_teec::{
 use log::{info, debug, error};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-
-/// TA UUID — must match `TA_UUID` in `secret_proxy_ta/src/main.rs`.
-/// The `teec_cc_bridge` uses this to locate the TA's Unix socket at
-/// `/tmp/{uuid}.sock`.
-pub(crate) const TA_UUID: &str = "a3f79c15-72d0-4e3a-b8d1-9f2ca3e81054";
-
-/// GP TEE command IDs — must match the constants in `secret_proxy_ta/src/main.rs`.
-/// These are passed as `cmd_id` to `TEEC_InvokeCommand()`.
-
-pub(crate) const CMD_PROXY_REQUEST:  u32 = 0x0001;
-pub(crate) const CMD_PROVISION_KEY:  u32 = 0x0002;
-const CMD_REMOVE_KEY:     u32 = 0x0003;
-pub(crate) const CMD_LIST_SLOTS:     u32 = 0x0004;
-const CMD_ADD_WHITELIST:  u32 = 0x0005;
-pub(crate) const CMD_RELAY_DATA:     u32 = 0x0006;
-pub(crate) const CMD_LIST_SLOTS_META: u32 = 0x0007;
-
-/// Business result codes returned in `params[1].value.a` by the TA.
-/// Must match the constants in `secret_proxy_ta/src/main.rs`.
-
-const BIZ_SUCCESS:           u32 = 0x900D;
-pub(crate) const BIZ_RELAY_START:       u32 = 0x9001;
-pub(crate) const BIZ_RELAY_CONTINUE:    u32 = 0x9002;
-pub(crate) const BIZ_RELAY_DONE:        u32 = 0x9003;
-pub(crate) const BIZ_RELAY_STREAMING:   u32 = 0x9004;
-const BIZ_ERR_BAD_JSON:      u32 = 0xE001;
-const BIZ_ERR_KEY_NOT_FOUND: u32 = 0xE004;
-const BIZ_ERR_FORBIDDEN:     u32 = 0xE005;
-const BIZ_ERR_TRANSPORT:     u32 = 0xE006;
 
 // ---------------------------------------------------------------------------
 // Shared data types — must match protocol.rs in secret_proxy_ta.

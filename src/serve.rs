@@ -41,15 +41,11 @@ use crate::{
     TA_UUID, CMD_PROXY_REQUEST, CMD_RELAY_DATA,
     BIZ_RELAY_START, BIZ_RELAY_CONTINUE, BIZ_RELAY_DONE, BIZ_RELAY_STREAMING,
     HttpMethod, ProxyRequest,
+    // Admin-API constants (moved to crate::constants in Step 1 refactor,
+    // re-exported at crate root — see main.rs top).
+    ADMIN_TOKEN_ENV, ADMIN_TOKEN_PREV_ENV, ADMIN_TOKEN_MIN_LEN,
+    ADMIN_ACTOR_HEADER, ADMIN_REQUEST_ID_HEADER,
 };
-
-/// Env var: shared secret required for `GET/POST /admin/*` (HTTP header `X-Admin-Token`).
-const ADMIN_TOKEN_ENV: &str = "SECRET_PROXY_CA_ADMIN_TOKEN";
-/// Optional previous token during rotation window.
-const ADMIN_TOKEN_PREV_ENV: &str = "SECRET_PROXY_CA_ADMIN_TOKEN_PREV";
-const ADMIN_TOKEN_MIN_LEN: usize = 32;
-const ADMIN_ACTOR_HEADER: &str = "x-openclaw-actor";
-const ADMIN_REQUEST_ID_HEADER: &str = "x-request-id";
 
 #[derive(Clone, Debug)]
 struct AdminAuditContext {

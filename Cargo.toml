@@ -16,3 +16,7 @@ env_logger = "0.11"
 # subcommand touches AF_VSOCK / sockaddr_vm / connect(2) directly and needs
 # a direct dependency for clear usage-site attribution.
 libc = "0.2"
+# thiserror: typed errors for the refactored module tree.
+# Keeps Result<T, String> compatible via a From<Error> for String bridge
+# (see src/error.rs) so migration can proceed incrementally.
+thiserror = "1"
