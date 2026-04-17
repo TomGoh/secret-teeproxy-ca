@@ -1,58 +1,38 @@
-//! HTTP serve mode for secret_proxy_ca — SSE streaming support.
+//! Per-connection HTTP handler for serve mode.
 //!
-//! Starts a persistent HTTP server that accepts `SecretProxyRequest` JSON
-//! via POST and returns **SSE (Server-Sent Events)** responses streamed
-//! from the LLM API through the TEEC relay.
+//! One function [`handle_connection`] covers the full lifecycle of an
+//! accepted TCP client: parse the HTTP request, route on method+path,
+//! dispatch to `/health`, admin API, or the SSE proxy handler.
 //!
-//! This bridges OpenClaw's `secret-proxy-wrapper.ts` (which uses `streamSimple`
-//! expecting Anthropic-format SSE) with the TA's `BIZ_RELAY_STREAMING` protocol.
+//! Step 9 refactor: this used to be `serve.rs::handle_http_connection`
+//! (plus its private helpers). It moved here verbatim — the only
+//! renames are `handle_http_connection → handle_connection` and the
+//! serve.rs doc-string was split between `server/mod.rs` (data-flow
+//! overview) and this module (per-connection details).
 //!
-//! Uses raw `TcpListener` instead of an HTTP framework because we need full
-//! control over response streaming — writing SSE chunks as they arrive from
-//! the TEEC relay, not buffering the entire response.
-//!
-//! # Data flow
-//! ```text
-//! OpenClaw (streamSimple)
-//!   → HTTP POST to CA (localhost:18790)
-//!   → CA parses SecretProxyRequest
-//!   → CA calls TEEC CMD_PROXY_REQUEST → TA starts relay
-//!   → CA TCP connects to LLM API target
-//!   → relay loop: TA decrypts SSE → BIZ_RELAY_STREAMING → CA pipes to OpenClaw
-//!   → OpenClaw receives Anthropic SSE events in real-time
-//! ```
+//! The accept loop + TEEC session lifecycle now live in
+//! [`crate::server::run`] in `server/mod.rs`; config parsing is in
+//! [`crate::server::config`].
 
 use std::io::{BufReader, Write};
 use std::mem;
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 
-// Step 5 refactor: raw `TEEC_InitializeContext / TEEC_OpenSession / TEEC_Close*`
-// calls migrated into `teec::RealTeec`. `TEEC_InvokeCommand` now goes through
-// the `Teec` trait so unit tests can drive serve-mode handlers with a mock.
 use cc_teec::raw;
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    parse_arg_u32, check_teec_rc,
+    check_teec_rc,
     ta_error_layer, teec_list_slots, teec_list_slots_meta, teec_provision_key, teec_remove_key,
     ProvisionKeyPayload,
     SlotEntry,
-    TA_UUID, CMD_PROXY_REQUEST,
+    CMD_PROXY_REQUEST,
     BIZ_RELAY_START,
     HttpMethod, ProxyRequest,
-    // Admin-API constants (moved to crate::constants in Step 1 refactor,
-    // re-exported at crate root — see main.rs top).
-    // ADMIN_TOKEN_MIN_LEN migrated with `validate_admin_token_strength` to
-    // `crate::http::headers` in Step 2, so no longer imported here.
-    // Step 7b refactor: CMD_RELAY_DATA + BIZ_RELAY_{CONTINUE,DONE,STREAMING}
-    // imports removed — they're only used inside `relay::{core,session}`
-    // now. BIZ_RELAY_START stays because `handle_proxy_post` still checks
-    // it as the expected response from CMD_PROXY_REQUEST.
-    ADMIN_TOKEN_ENV, ADMIN_TOKEN_PREV_ENV,
     ADMIN_ACTOR_HEADER, ADMIN_REQUEST_ID_HEADER,
 };
-use crate::teec::{RealTeec, Teec};
+use crate::teec::Teec;
 
 #[derive(Clone, Debug)]
 struct AdminAuditContext {
@@ -79,81 +59,9 @@ fn default_method() -> String {
     "Post".into()
 }
 
-/// Start the HTTP serve mode with SSE streaming support.
-///
-/// # Logic
-/// 1. Parse `--port` from args (default 18790).
-/// 2. Initialize TEEC context and open a persistent session to the TA.
-/// 3. Bind TCP listener on `0.0.0.0:{port}`.
-/// 4. For each incoming connection:
-///    a. Parse HTTP POST request (headers + body).
-///    b. Extract `SecretProxyRequest` fields from JSON body.
-///    c. Run TEEC relay, streaming the TA's decrypted SSE data directly
-///       to the HTTP response.
-/// 5. TEEC session remains open across requests.
-pub fn cmd_serve(args: &[String]) -> Result<(), String> {
-    let port = parse_arg_u32(args, "--port").unwrap_or(18790);
-
-    info!("serve mode starting on port {port}");
-
-    // Initialize TEEC (persistent, reused across all requests). Step 5
-    // refactor: the init/open/close/finalize dance now lives inside
-    // `RealTeec` (Drop handles cleanup in the same order as before).
-    let mut teec = RealTeec::open(TA_UUID)?;
-
-    info!("TEEC session established (persistent)");
-
-    if let Ok(token) = std::env::var(ADMIN_TOKEN_ENV) {
-        if token.is_empty() {
-            return Err(format!("{ADMIN_TOKEN_ENV} is set but empty"));
-        }
-        validate_admin_token_strength(&token)
-            .map_err(|e| format!("invalid {ADMIN_TOKEN_ENV}: {e}"))?;
-        if let Ok(prev_token) = std::env::var(ADMIN_TOKEN_PREV_ENV) {
-            if !prev_token.is_empty() {
-                validate_admin_token_strength(&prev_token)
-                    .map_err(|e| format!("invalid {ADMIN_TOKEN_PREV_ENV}: {e}"))?;
-            }
-        }
-    } else {
-        warn!("admin API disabled: set {ADMIN_TOKEN_ENV} to enable admin endpoints");
-    }
-
-    // Bind HTTP server
-    let listener = TcpListener::bind(format!("0.0.0.0:{port}"))
-        .map_err(|e| format!("TCP bind failed: {e}"))?;
-
-    info!("HTTP server listening on http://0.0.0.0:{port}");
-    info!("proxy: POST / with SecretProxyRequest JSON → SSE");
-    info!("health: GET /health (TEEC + TA probe, no auth)");
-    info!(
-        "admin: GET /admin/keys/slots, POST /admin/keys/provision, POST /admin/keys/remove (requires {ADMIN_TOKEN_ENV})"
-    );
-
-    for stream in listener.incoming() {
-        match stream {
-            Ok(client) => {
-                if let Err(e) = handle_http_connection(&mut teec, client) {
-                    error!("serve error: {e}");
-                }
-            }
-            Err(e) => error!("accept error: {e}"),
-        }
-    }
-
-    // `teec` drops here — closes session + finalizes context in the same
-    // order as the pre-refactor manual cleanup (session first, then context).
-    Ok(())
-}
-
 // Pure header / token helpers moved to `crate::http::headers` in Step 2.
-// After Step 4 `check_admin_token` moved to `crate::server::admin`, so
-// `constant_time_equal` and `normalize_http_path` are no longer needed
-// directly in serve.rs. `header_value` is still used by `admin_audit_context`;
-// `validate_admin_token_strength` is used by the startup env validation.
-use crate::http::headers::{header_value, validate_admin_token_strength};
-// Step 7b refactor: ChunkedDecoder moved inside the relay state machine
-// (`crate::relay::core::RelayState`); serve.rs no longer manages one directly.
+// `header_value` is still used by `admin_audit_context`.
+use crate::http::headers::header_value;
 
 fn admin_audit_context(headers_block: &str, client: &TcpStream) -> AdminAuditContext {
     let actor = header_value(headers_block, ADMIN_ACTOR_HEADER).unwrap_or_else(|| "unknown".into());
@@ -183,11 +91,8 @@ fn send_json_response(client: &mut TcpStream, status: u16, status_text: &str, js
     let _ = client.write_all(response.as_bytes());
 }
 
-// `check_admin_token` moved to `crate::server::admin` in Step 4.
-// Behavior identical (same env var names, same rotation window, same
-// constant-time compare) but now takes an injectable EnvSource for
-// unit tests without polluting the process environment.
-use crate::server::admin::check_admin_token;
+// `check_admin_token` lives in the sibling module `server::admin` (Step 4).
+use super::admin::check_admin_token;
 
 #[derive(Deserialize)]
 struct AdminProvisionBody {
@@ -260,7 +165,7 @@ struct HealthTa {
 }
 
 /// Handle one HTTP connection: read request, optional admin API, or TEEC relay + SSE.
-fn handle_http_connection(
+pub(crate) fn handle_connection(
     teec: &mut dyn Teec,
     mut client: TcpStream,
 ) -> Result<(), String> {

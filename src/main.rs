@@ -24,7 +24,6 @@ mod error;
 mod http;
 mod relay;
 mod server;
-mod serve;
 mod sse;
 mod teec;
 
@@ -184,9 +183,11 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    // `serve` manages its own TEEC lifecycle (long-lived session)
+    // `serve` manages its own TEEC lifecycle (long-lived session).
+    // Step 9 refactor: the serve-mode entry moved from `serve::cmd_serve`
+    // to `server::run` as part of the serve.rs teardown.
     if args[1] == "serve" {
-        return serve::cmd_serve(&args[2..]);
+        return server::run(&args[2..]);
     }
 
     // `dns-test` is a TEEC-free diagnostic: it just calls `to_socket_addrs`
