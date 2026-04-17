@@ -20,3 +20,12 @@ libc = "0.2"
 # Keeps Result<T, String> compatible via a From<Error> for String bridge
 # (see src/error.rs) so migration can proceed incrementally.
 thiserror = "1"
+
+[features]
+# Expose test-only mocks (currently `teec::mock::MockTeec`) to integration
+# tests under `tools/secret_proxy_ca/tests/`. Always active under
+# `#[cfg(test)]` for unit tests inside this crate; the feature flag exists
+# for the Step 10 integration tests. Keeping the declaration here now so
+# `cargo check --cfg feature="test-support"` stops emitting the unexpected-
+# cfg warning introduced in Step 5.
+test-support = []

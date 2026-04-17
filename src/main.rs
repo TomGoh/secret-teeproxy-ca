@@ -24,6 +24,7 @@ mod error;
 mod http;
 mod server;
 mod serve;
+mod teec;
 
 // Re-export constants at the crate root so existing `crate::TA_UUID` imports
 // (notably in serve.rs) keep compiling without churn during the refactor.
@@ -46,13 +47,15 @@ use std::{collections::HashMap, mem};
 // used by the removed `cmd_proxy` + `relay_loop`; pruned here. The logging
 // crate `log::error` macro is still needed by the main entry point.
 
-use cc_teec::{
-    TEEC_CloseSession, TEEC_FinalizeContext, TEEC_InitializeContext, TEEC_InvokeCommand,
-    TEEC_OpenSession, raw,
-};
+// Step 5 refactor: raw `TEEC_InitializeContext / TEEC_OpenSession / TEEC_Close*`
+// calls moved inside `teec::RealTeec`. Only `TEEC_Operation` plumbing +
+// `TEEC_PARAM_TYPES` constants are still touched directly by the command
+// helpers below. `TEEC_InvokeCommand` now goes through `Teec::invoke`.
+use cc_teec::raw;
 use log::error;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+
+use crate::teec::{RealTeec, Teec};
 
 // ---------------------------------------------------------------------------
 // Shared data types — must match protocol.rs in secret_proxy_ta.
@@ -242,58 +245,36 @@ fn run() -> Result<(), String> {
         return vsock_test(cid, port);
     }
 
-    let ta_uuid = parse_uuid(TA_UUID)?;
-
-    // Open TEE session
-    let mut ctx: raw::TEEC_Context = unsafe { mem::zeroed() };
-    let mut session: raw::TEEC_Session = unsafe { mem::zeroed() };
-    let mut origin = 0u32;
-
-    let rc = TEEC_InitializeContext(std::ptr::null(), &mut ctx);
-    if rc != raw::TEEC_SUCCESS {
-        return Err(format!("TEEC_InitializeContext failed: 0x{rc:08x}"));
-    }
-
-    let rc = TEEC_OpenSession(
-        &mut ctx,
-        &mut session,
-        &ta_uuid,
-        raw::TEEC_LOGIN_PUBLIC,
-        std::ptr::null(),
-        std::ptr::null_mut(),
-        &mut origin,
-    );
-    if rc != raw::TEEC_SUCCESS {
-        TEEC_FinalizeContext(&mut ctx);
-        return Err(format!("TEEC_OpenSession failed: 0x{rc:08x}, origin={origin}"));
-    }
+    // Step 5 refactor: TEEC context + session setup + teardown moved inside
+    // `RealTeec::open`/`Drop`. Behavior is identical — same UUID parse, same
+    // TEEC_InitializeContext + TEEC_OpenSession sequence, same close-session
+    // -before-finalize-context cleanup ordering — but the command helpers now
+    // take `&mut dyn Teec` so they are unit-testable with `MockTeec`.
+    let mut teec = RealTeec::open(TA_UUID)?;
 
     // Step 8 refactor (2026-04-17): the `proxy` CLI subcommand and its
     // 185-LOC companion `relay_loop` were removed. Verified via grep that
     // nothing outside this crate invoked `secret_proxy_ca proxy` —
     // openclaw uses the HTTP `serve` mode directly, and no shell script
     // or deploy script referenced the CLI path.
-    let result = match args[1].as_str() {
-        "list-slots"     => cmd_list_slots(&mut session),
-        "provision-key"  => cmd_provision_key(&mut session, &args[2..]),
-        "remove-key"     => cmd_remove_key(&mut session, &args[2..]),
-        "add-whitelist"  => cmd_add_whitelist(&mut session, &args[2..]),
+    match args[1].as_str() {
+        "list-slots"     => cmd_list_slots(&mut teec),
+        "provision-key"  => cmd_provision_key(&mut teec, &args[2..]),
+        "remove-key"     => cmd_remove_key(&mut teec, &args[2..]),
+        "add-whitelist"  => cmd_add_whitelist(&mut teec, &args[2..]),
         other => {
             error!("unknown command: {other}");
             print_usage(&args[0]);
             Ok(())
         }
-    };
-
-    TEEC_CloseSession(&mut session);
-    TEEC_FinalizeContext(&mut ctx);
-
-    result
+    }
+    // `teec` is dropped here — closes session + finalizes context in the
+    // same order as the pre-refactor manual cleanup.
 }
 
 /// List all occupied key slot IDs in the TA via CMD_LIST_SLOTS (0x0004).
 /// Shared by CLI and HTTP admin API.
-pub(crate) fn teec_list_slots(session: &mut raw::TEEC_Session) -> Result<Vec<u32>, String> {
+pub(crate) fn teec_list_slots(teec: &mut dyn Teec) -> Result<Vec<u32>, String> {
     let mut response_buf = vec![0u8; 4096];
     let mut op: raw::TEEC_Operation = unsafe { mem::zeroed() };
     op.paramTypes = raw::TEEC_PARAM_TYPES(
@@ -305,8 +286,7 @@ pub(crate) fn teec_list_slots(session: &mut raw::TEEC_Session) -> Result<Vec<u32
     op.params[0].tmpref.buffer = response_buf.as_mut_ptr() as *mut _;
     op.params[0].tmpref.size = response_buf.len();
 
-    let mut origin = 0u32;
-    let rc = TEEC_InvokeCommand(session, CMD_LIST_SLOTS, &mut op, &mut origin);
+    let (rc, origin) = teec.invoke(CMD_LIST_SLOTS, &mut op);
     check_teec_rc(rc, origin)?;
 
     let biz_code = unsafe { op.params[1].value.a };
@@ -320,7 +300,7 @@ pub(crate) fn teec_list_slots(session: &mut raw::TEEC_Session) -> Result<Vec<u32
 }
 
 /// List occupied slots with provider names (no key material) via CMD_LIST_SLOTS_META (0x0007).
-pub(crate) fn teec_list_slots_meta(session: &mut raw::TEEC_Session) -> Result<Vec<SlotEntry>, String> {
+pub(crate) fn teec_list_slots_meta(teec: &mut dyn Teec) -> Result<Vec<SlotEntry>, String> {
     let mut response_buf = vec![0u8; 4096];
     let mut op: raw::TEEC_Operation = unsafe { mem::zeroed() };
     op.paramTypes = raw::TEEC_PARAM_TYPES(
@@ -332,8 +312,7 @@ pub(crate) fn teec_list_slots_meta(session: &mut raw::TEEC_Session) -> Result<Ve
     op.params[0].tmpref.buffer = response_buf.as_mut_ptr() as *mut _;
     op.params[0].tmpref.size = response_buf.len();
 
-    let mut origin = 0u32;
-    let rc = TEEC_InvokeCommand(session, CMD_LIST_SLOTS_META, &mut op, &mut origin);
+    let (rc, origin) = teec.invoke(CMD_LIST_SLOTS_META, &mut op);
     check_teec_rc(rc, origin)?;
 
     let biz_code = unsafe { op.params[1].value.a };
@@ -370,8 +349,8 @@ pub(crate) fn ta_error_layer(message: &str) -> &'static str {
 /// 2. `TEEC_InvokeCommand(CMD_LIST_SLOTS)`.
 /// 3. Read `params[1].value.b` for the count and `params[0]` for the JSON.
 /// 4. Deserialize and print: `Slots (N total): [0, 1, 7]`.
-fn cmd_list_slots(session: &mut raw::TEEC_Session) -> Result<(), String> {
-    let slots = teec_list_slots(session)?;
+fn cmd_list_slots(teec: &mut dyn Teec) -> Result<(), String> {
+    let slots = teec_list_slots(teec)?;
     let count = slots.len();
     println!("Slots ({count} total): {slots:?}");
     Ok(())
@@ -380,7 +359,7 @@ fn cmd_list_slots(session: &mut raw::TEEC_Session) -> Result<(), String> {
 /// Store an API key in the TA's key slot via CMD_PROVISION_KEY (0x0002).
 /// Shared by CLI and HTTP admin API.
 pub(crate) fn teec_provision_key(
-    session: &mut raw::TEEC_Session,
+    teec: &mut dyn Teec,
     payload: &ProvisionKeyPayload,
 ) -> Result<(), String> {
     let mut json = serde_json::to_vec(payload).map_err(|e| format!("serialize error: {e}"))?;
@@ -395,8 +374,7 @@ pub(crate) fn teec_provision_key(
     op.params[0].tmpref.buffer = json.as_mut_ptr() as *mut _;
     op.params[0].tmpref.size = json.len();
 
-    let mut origin = 0u32;
-    let rc = TEEC_InvokeCommand(session, CMD_PROVISION_KEY, &mut op, &mut origin);
+    let (rc, origin) = teec.invoke(CMD_PROVISION_KEY, &mut op);
     check_teec_rc(rc, origin)?;
 
     let biz_code = unsafe { op.params[1].value.a };
@@ -406,7 +384,7 @@ pub(crate) fn teec_provision_key(
 }
 
 /// Remove an API key from a TA slot via CMD_REMOVE_KEY.
-pub(crate) fn teec_remove_key(session: &mut raw::TEEC_Session, slot: u32) -> Result<(), String> {
+pub(crate) fn teec_remove_key(teec: &mut dyn Teec, slot: u32) -> Result<(), String> {
     let mut op: raw::TEEC_Operation = unsafe { mem::zeroed() };
     op.paramTypes = raw::TEEC_PARAM_TYPES(
         raw::TEEC_VALUE_INPUT,
@@ -417,8 +395,7 @@ pub(crate) fn teec_remove_key(session: &mut raw::TEEC_Session, slot: u32) -> Res
     op.params[0].value.a = slot;
     op.params[0].value.b = 0;
 
-    let mut origin = 0u32;
-    let rc = TEEC_InvokeCommand(session, CMD_REMOVE_KEY, &mut op, &mut origin);
+    let (rc, origin) = teec.invoke(CMD_REMOVE_KEY, &mut op);
     check_teec_rc(rc, origin)?;
 
     let biz_code = unsafe { op.params[1].value.a };
@@ -441,13 +418,13 @@ pub(crate) fn teec_remove_key(session: &mut raw::TEEC_Session, slot: u32) -> Res
 /// 2. Serialize `ProvisionKeyPayload` to JSON.
 /// 3. `TEEC_InvokeCommand(CMD_PROVISION_KEY)` with JSON as MemrefInput.
 /// 4. Check TEEC return code and business code.
-fn cmd_provision_key(session: &mut raw::TEEC_Session, args: &[String]) -> Result<(), String> {
+fn cmd_provision_key(teec: &mut dyn Teec, args: &[String]) -> Result<(), String> {
     let slot = parse_arg_u32(args, "--slot")?;
     let key = parse_arg_str(args, "--key")?;
     let provider = parse_arg_str(args, "--provider")?;
 
     let payload = ProvisionKeyPayload { slot, key, provider };
-    teec_provision_key(session, &payload)?;
+    teec_provision_key(teec, &payload)?;
 
     println!("Key provisioned in slot {slot}");
     Ok(())
@@ -462,9 +439,9 @@ fn cmd_provision_key(session: &mut raw::TEEC_Session, args: &[String]) -> Result
 /// - `params[0]` ValueInput:   `{a: slot_id, b: 0}` (no JSON needed for a single u32)
 /// - `params[1]` ValueOutput:  `{a: BIZ_SUCCESS, b: 0}` or
 ///                             `{a: BIZ_ERR_KEY_NOT_FOUND, b: slot_id}`
-fn cmd_remove_key(session: &mut raw::TEEC_Session, args: &[String]) -> Result<(), String> {
+fn cmd_remove_key(teec: &mut dyn Teec, args: &[String]) -> Result<(), String> {
     let slot = parse_arg_u32(args, "--slot")?;
-    teec_remove_key(session, slot)?;
+    teec_remove_key(teec, slot)?;
     println!("Slot {slot} removed");
     Ok(())
 }
@@ -480,7 +457,7 @@ fn cmd_remove_key(session: &mut raw::TEEC_Session, args: &[String]) -> Result<()
 ///
 /// The TA uses prefix matching: a request to `endpoint_url` is allowed if
 /// `endpoint_url.starts_with(pattern)` for any whitelisted pattern.
-fn cmd_add_whitelist(session: &mut raw::TEEC_Session, args: &[String]) -> Result<(), String> {
+fn cmd_add_whitelist(teec: &mut dyn Teec, args: &[String]) -> Result<(), String> {
     let pattern = parse_arg_str(args, "--pattern")?;
 
     let payload = AddWhitelistPayload { pattern: pattern.clone() };
@@ -496,8 +473,7 @@ fn cmd_add_whitelist(session: &mut raw::TEEC_Session, args: &[String]) -> Result
     op.params[0].tmpref.buffer = json.as_mut_ptr() as *mut _;
     op.params[0].tmpref.size = json.len();
 
-    let mut origin = 0u32;
-    let rc = TEEC_InvokeCommand(session, CMD_ADD_WHITELIST, &mut op, &mut origin);
+    let (rc, origin) = teec.invoke(CMD_ADD_WHITELIST, &mut op);
     check_teec_rc(rc, origin)?;
 
     let biz_code = unsafe { op.params[1].value.a };
@@ -513,28 +489,8 @@ fn cmd_add_whitelist(session: &mut raw::TEEC_Session, args: &[String]) -> Result
 /// 1. Parse CLI arguments: `--slot`, `--url`, `--body`, `--method`, `--stream`.
 /// 2. Build a `ProxyRequest` JSON and send via `TEEC_InvokeCommand(CMD_PROXY_REQUEST)`.
 
-/// Parse a UUID string (e.g. "a3f79c15-72d0-4e3a-b8d1-9f2ca3e81054") into the
-/// `TEEC_UUID` struct required by rust-libteec.
-///
-/// # Arguments
-/// * `s` - UUID string in standard 8-4-4-4-12 format
-///
-/// # Returns
-/// `Ok(TEEC_UUID)` on success.  The struct fields (timeLow, timeMid, etc.)
-/// are populated from the UUID's binary representation.
-pub(crate) fn parse_uuid(s: &str) -> Result<raw::TEEC_UUID, String> {
-    Uuid::parse_str(s)
-        .map(|u| {
-            let (time_low, time_mid, time_hi_and_version, clock_seq_and_node) = u.as_fields();
-            raw::TEEC_UUID {
-                timeLow: time_low,
-                timeMid: time_mid,
-                timeHiAndVersion: time_hi_and_version,
-                clockSeqAndNode: *clock_seq_and_node,
-            }
-        })
-        .map_err(|e| format!("UUID parse failed: {e}"))
-}
+// Step 5 refactor: `parse_uuid` moved to `crate::teec::real` (only used
+// during TEE session open, now encapsulated in `RealTeec::open`).
 
 /// Check the TEEC return code from `TEEC_InvokeCommand`.
 ///
@@ -708,5 +664,137 @@ fn errno_hint(errno: i32) -> &'static str {
         libc::EPERM        => "  (operation not permitted; check process uid/capabilities)",
         libc::ENETUNREACH  => "  (network unreachable; kernel vsock configuration may be incomplete)",
         _                  => "",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Step 5 param-layout validation tests
+//
+// These tests drive each TEEC helper with a `MockTeec` and assert that the
+// cmd_id + paramTypes combination exactly matches what the TA expects.
+// The TA checks `op.paramTypes` on entry and silently fails when the bit
+// pattern is wrong — a bug that is nearly impossible to diagnose from the
+// CA side. Locking the layout at unit-test time means any future reorder
+// (e.g. dropping a VALUE_OUTPUT or flipping INPUT↔OUTPUT) trips the test
+// locally, before the Android deploy.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod teec_layout_tests {
+    use super::*;
+    use crate::teec::mock::MockTeec;
+    use cc_teec::raw;
+
+    /// CMD_LIST_SLOTS (0x0004): params[0]=MEMREF_TEMP_OUTPUT (slot JSON),
+    ///   params[1]=VALUE_OUTPUT (biz_code).
+    #[test]
+    fn list_slots_layout() {
+        let mut mock = MockTeec::new();
+        mock.queue_blob_and_biz(CMD_LIST_SLOTS, BIZ_SUCCESS, b"[0]".to_vec());
+        let slots = teec_list_slots(&mut mock).expect("success path");
+        assert_eq!(slots, vec![0u32]);
+        assert_eq!(mock.calls.len(), 1);
+        assert_eq!(mock.calls[0].cmd_id, CMD_LIST_SLOTS);
+        assert_eq!(
+            mock.calls[0].param_types,
+            raw::TEEC_PARAM_TYPES(
+                raw::TEEC_MEMREF_TEMP_OUTPUT,
+                raw::TEEC_VALUE_OUTPUT,
+                raw::TEEC_NONE,
+                raw::TEEC_NONE,
+            ),
+        );
+    }
+
+    /// CMD_LIST_SLOTS_META (0x0007): same layout as CMD_LIST_SLOTS but
+    /// returns JSON array of `{slot, provider}` objects.
+    #[test]
+    fn list_slots_meta_layout() {
+        let mut mock = MockTeec::new();
+        mock.queue_blob_and_biz(
+            CMD_LIST_SLOTS_META,
+            BIZ_SUCCESS,
+            br#"[{"slot":0,"provider":"minimax-anthropic"}]"#.to_vec(),
+        );
+        let entries = teec_list_slots_meta(&mut mock).expect("success path");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].slot, 0);
+        assert_eq!(entries[0].provider, "minimax-anthropic");
+        assert_eq!(
+            mock.calls[0].param_types,
+            raw::TEEC_PARAM_TYPES(
+                raw::TEEC_MEMREF_TEMP_OUTPUT,
+                raw::TEEC_VALUE_OUTPUT,
+                raw::TEEC_NONE,
+                raw::TEEC_NONE,
+            ),
+        );
+    }
+
+    /// CMD_PROVISION_KEY (0x0002): params[0]=MEMREF_TEMP_INPUT (JSON
+    /// key payload), params[1]=VALUE_OUTPUT (biz_code).
+    #[test]
+    fn provision_key_layout() {
+        let mut mock = MockTeec::new();
+        mock.queue_biz(CMD_PROVISION_KEY, BIZ_SUCCESS);
+        let payload = ProvisionKeyPayload {
+            slot: 0,
+            key: "sk-test".into(),
+            provider: "minimax".into(),
+        };
+        teec_provision_key(&mut mock, &payload).expect("success path");
+        assert_eq!(
+            mock.calls[0].param_types,
+            raw::TEEC_PARAM_TYPES(
+                raw::TEEC_MEMREF_TEMP_INPUT,
+                raw::TEEC_VALUE_OUTPUT,
+                raw::TEEC_NONE,
+                raw::TEEC_NONE,
+            ),
+        );
+    }
+
+    /// CMD_REMOVE_KEY (0x0003): params[0]=VALUE_INPUT (slot_id in .a),
+    /// params[1]=VALUE_OUTPUT. The slot id is passed by value, not JSON.
+    #[test]
+    fn remove_key_layout() {
+        let mut mock = MockTeec::new();
+        mock.queue_biz(CMD_REMOVE_KEY, BIZ_SUCCESS);
+        teec_remove_key(&mut mock, 7).expect("success path");
+        assert_eq!(
+            mock.calls[0].param_types,
+            raw::TEEC_PARAM_TYPES(
+                raw::TEEC_VALUE_INPUT,
+                raw::TEEC_VALUE_OUTPUT,
+                raw::TEEC_NONE,
+                raw::TEEC_NONE,
+            ),
+        );
+    }
+
+    /// Biz-code errors surface as `TA error 0x...: <msg>` strings so the
+    /// admin API can distinguish them from TEEC_InvokeCommand failures.
+    #[test]
+    fn biz_error_surfaces_as_ta_error_string() {
+        let mut mock = MockTeec::new();
+        mock.queue_biz(CMD_REMOVE_KEY, BIZ_ERR_KEY_NOT_FOUND);
+        let err = teec_remove_key(&mut mock, 99).unwrap_err();
+        assert!(err.starts_with("TA error 0x"), "got: {err}");
+        assert!(err.contains("key slot not found"), "got: {err}");
+    }
+
+    /// TEEC-level errors (bad session, bridge down, etc.) surface as
+    /// `TEEC_InvokeCommand failed: ...` so `ta_error_layer` can tag
+    /// them distinctly in `/health`.
+    #[test]
+    fn teec_rc_error_surfaces_as_invoke_failed_string() {
+        let mut mock = MockTeec::new();
+        // TEEC_ERROR_COMMUNICATION == 0xFFFF000E per GP spec.
+        mock.queue_rc(CMD_LIST_SLOTS, 0xFFFF000E, 2);
+        let err = teec_list_slots(&mut mock).unwrap_err();
+        assert!(err.starts_with("TEEC_InvokeCommand failed:"), "got: {err}");
+        assert!(err.contains("0xffff000e"), "got: {err}");
+        assert!(err.contains("origin=2"), "got: {err}");
+        // Regression: the health handler uses this tag to route errors.
+        assert_eq!(ta_error_layer(&err), "teec_invoke");
     }
 }

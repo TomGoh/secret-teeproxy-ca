@@ -26,15 +26,15 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::mem;
 use std::net::{TcpListener, TcpStream};
 
-use cc_teec::{
-    TEEC_CloseSession, TEEC_FinalizeContext, TEEC_InitializeContext, TEEC_InvokeCommand,
-    TEEC_OpenSession, raw,
-};
+// Step 5 refactor: raw `TEEC_InitializeContext / TEEC_OpenSession / TEEC_Close*`
+// calls migrated into `teec::RealTeec`. `TEEC_InvokeCommand` now goes through
+// the `Teec` trait so unit tests can drive serve-mode handlers with a mock.
+use cc_teec::raw;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    parse_arg_u32, parse_uuid, check_teec_rc,
+    parse_arg_u32, check_teec_rc,
     ta_error_layer, teec_list_slots, teec_list_slots_meta, teec_provision_key, teec_remove_key,
     ProvisionKeyPayload,
     SlotEntry,
@@ -48,6 +48,7 @@ use crate::{
     ADMIN_TOKEN_ENV, ADMIN_TOKEN_PREV_ENV,
     ADMIN_ACTOR_HEADER, ADMIN_REQUEST_ID_HEADER,
 };
+use crate::teec::{RealTeec, Teec};
 
 #[derive(Clone, Debug)]
 struct AdminAuditContext {
@@ -91,30 +92,10 @@ pub fn cmd_serve(args: &[String]) -> Result<(), String> {
 
     info!("serve mode starting on port {port}");
 
-    // Initialize TEEC (persistent, reused across all requests)
-    let ta_uuid = parse_uuid(TA_UUID)?;
-    let mut ctx: raw::TEEC_Context = unsafe { mem::zeroed() };
-    let mut session: raw::TEEC_Session = unsafe { mem::zeroed() };
-    let mut origin = 0u32;
-
-    let rc = TEEC_InitializeContext(std::ptr::null(), &mut ctx);
-    if rc != raw::TEEC_SUCCESS {
-        return Err(format!("TEEC_InitializeContext failed: 0x{rc:08x}"));
-    }
-
-    let rc = TEEC_OpenSession(
-        &mut ctx,
-        &mut session,
-        &ta_uuid,
-        raw::TEEC_LOGIN_PUBLIC,
-        std::ptr::null(),
-        std::ptr::null_mut(),
-        &mut origin,
-    );
-    if rc != raw::TEEC_SUCCESS {
-        TEEC_FinalizeContext(&mut ctx);
-        return Err(format!("TEEC_OpenSession failed: 0x{rc:08x}, origin={origin}"));
-    }
+    // Initialize TEEC (persistent, reused across all requests). Step 5
+    // refactor: the init/open/close/finalize dance now lives inside
+    // `RealTeec` (Drop handles cleanup in the same order as before).
+    let mut teec = RealTeec::open(TA_UUID)?;
 
     info!("TEEC session established (persistent)");
 
@@ -148,7 +129,7 @@ pub fn cmd_serve(args: &[String]) -> Result<(), String> {
     for stream in listener.incoming() {
         match stream {
             Ok(client) => {
-                if let Err(e) = handle_http_connection(&mut session, client) {
+                if let Err(e) = handle_http_connection(&mut teec, client) {
                     error!("serve error: {e}");
                 }
             }
@@ -156,8 +137,8 @@ pub fn cmd_serve(args: &[String]) -> Result<(), String> {
         }
     }
 
-    TEEC_CloseSession(&mut session);
-    TEEC_FinalizeContext(&mut ctx);
+    // `teec` drops here — closes session + finalizes context in the same
+    // order as the pre-refactor manual cleanup (session first, then context).
     Ok(())
 }
 
@@ -275,7 +256,7 @@ struct HealthTa {
 
 /// Handle one HTTP connection: read request, optional admin API, or TEEC relay + SSE.
 fn handle_http_connection(
-    session: &mut raw::TEEC_Session,
+    teec: &mut dyn Teec,
     mut client: TcpStream,
 ) -> Result<(), String> {
     // Step 3 refactor: inline request parsing (request line + headers +
@@ -294,9 +275,9 @@ fn handle_http_connection(
 
     // --- GET /health (no auth): TEEC session open + TA list probe ---
     if path == "/health" && http_method == "GET" {
-        let health = match teec_list_slots(session) {
+        let health = match teec_list_slots(teec) {
             Ok(slots) => {
-                let (slot_entries, meta_warning) = match teec_list_slots_meta(session) {
+                let (slot_entries, meta_warning) = match teec_list_slots_meta(teec) {
                     Ok(e) => (Some(e), None),
                     Err(e) => (Some(Vec::new()), Some(e)),
                 };
@@ -362,9 +343,9 @@ fn handle_http_connection(
             );
             return Err(reason.into());
         }
-        match teec_list_slots(session) {
+        match teec_list_slots(teec) {
             Ok(slots) => {
-                let (slot_entries, meta_warning) = match teec_list_slots_meta(session) {
+                let (slot_entries, meta_warning) = match teec_list_slots_meta(teec) {
                     Ok(e) => (e, None),
                     Err(e) => {
                         warn!("admin list_slots: slot metadata unavailable: {e}");
@@ -443,11 +424,11 @@ fn handle_http_connection(
             key: parsed.key,
             provider: parsed.provider,
         };
-        match teec_provision_key(session, &payload) {
+        match teec_provision_key(teec, &payload) {
             Ok(()) => {
                 let slot_id = payload.slot;
                 let (verified, slots, slot_entries, verification_warning) =
-                    match (teec_list_slots(session), teec_list_slots_meta(session)) {
+                    match (teec_list_slots(teec), teec_list_slots_meta(teec)) {
                         (Ok(s), Ok(e)) => {
                             let v = s.contains(&slot_id);
                             (v, s, e, None)
@@ -526,10 +507,10 @@ fn handle_http_connection(
                 return Err(format!("admin remove bad JSON: {e}"));
             }
         };
-        match teec_remove_key(session, parsed.slot) {
+        match teec_remove_key(teec, parsed.slot) {
             Ok(()) => {
                 let (slots, slot_entries, verification_warning) =
-                    match (teec_list_slots(session), teec_list_slots_meta(session)) {
+                    match (teec_list_slots(teec), teec_list_slots_meta(teec)) {
                         (Ok(s), Ok(e)) => (s, e, None),
                         (Ok(s), Err(e)) => {
                             warn!("admin remove: post-verify meta failed: {e}");
@@ -579,13 +560,13 @@ fn handle_http_connection(
         send_json_response(&mut client, 405, "Method Not Allowed", &msg);
         Err("bad HTTP method".into())
     } else {
-        handle_proxy_post(session, client, body)
+        handle_proxy_post(teec, client, body)
     }
 }
 
 /// LLM proxy: parse `SecretProxyRequest` JSON and stream SSE (ignore extra fields from OpenClaw's `Object.assign`).
 fn handle_proxy_post(
-    session: &mut raw::TEEC_Session,
+    teec: &mut dyn Teec,
     mut client: TcpStream,
     body: Vec<u8>,
 ) -> Result<(), String> {
@@ -706,8 +687,7 @@ fn handle_proxy_post(
     op.params[3].tmpref.buffer = tls_buf.as_mut_ptr() as *mut _;
     op.params[3].tmpref.size = tls_buf.len();
 
-    let mut origin = 0u32;
-    let rc = TEEC_InvokeCommand(session, CMD_PROXY_REQUEST, &mut op, &mut origin);
+    let (rc, origin) = teec.invoke(CMD_PROXY_REQUEST, &mut op);
     if let Err(e) = check_teec_rc(rc, origin) {
         send_error(&mut client, 502, &e);
         return Err(e);
@@ -729,7 +709,7 @@ fn handle_proxy_post(
     info!("serve relay → {target}");
 
     // 5. Run relay loop, streaming SSE to client
-    relay_and_stream(session, target, initial_tls, &mut client)
+    relay_and_stream(teec, target, initial_tls, &mut client)
 }
 
 /// Run the TEEC relay loop and stream the response directly to the HTTP client.
@@ -746,7 +726,7 @@ fn handle_proxy_post(
 ///   the CA→OpenClaw connection uses its own framing.
 /// - On `BIZ_RELAY_DONE`: flush and close.
 fn relay_and_stream(
-    session: &mut raw::TEEC_Session,
+    teec: &mut dyn Teec,
     target: &str,
     initial_tls: &[u8],
     client: &mut TcpStream,
@@ -831,8 +811,7 @@ fn relay_and_stream(
         op.params[3].tmpref.buffer = tls_extra_buf.as_mut_ptr() as *mut _;
         op.params[3].tmpref.size = tls_extra_buf.len();
 
-        let mut origin = 0u32;
-        let rc = TEEC_InvokeCommand(session, CMD_RELAY_DATA, &mut op, &mut origin);
+        let (rc, origin) = teec.invoke(CMD_RELAY_DATA, &mut op);
         if let Err(e) = check_teec_rc(rc, origin) {
             if !response_started {
                 send_error(client, 502, &e);
@@ -876,8 +855,7 @@ fn relay_and_stream(
                     op2.params[3].tmpref.buffer = tls_extra_buf.as_mut_ptr() as *mut _;
                     op2.params[3].tmpref.size = tls_extra_buf.len();
 
-                    let mut origin2 = 0u32;
-                    let rc2 = TEEC_InvokeCommand(session, CMD_RELAY_DATA, &mut op2, &mut origin2);
+                    let (rc2, origin2) = teec.invoke(CMD_RELAY_DATA, &mut op2);
                     if let Err(e) = check_teec_rc(rc2, origin2) {
                         if !response_started { send_error(client, 502, &e); }
                         return Err(e);
