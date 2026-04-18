@@ -26,8 +26,8 @@
 use std::mem;
 
 use cc_teec::{
-    TEEC_CloseSession, TEEC_FinalizeContext, TEEC_InitializeContext, TEEC_InvokeCommand,
-    TEEC_OpenSession, raw,
+    raw, TEEC_CloseSession, TEEC_FinalizeContext, TEEC_InitializeContext, TEEC_InvokeCommand,
+    TEEC_OpenSession,
 };
 use uuid::Uuid;
 
@@ -126,12 +126,15 @@ mod tests {
 
     #[test]
     fn parse_uuid_accepts_rfc4122_form() {
-        let uuid = parse_uuid("a3f79c15-72d0-4e3a-b8d1-9f2ca3e81054")
-            .expect("valid UUID must parse");
+        let uuid =
+            parse_uuid("a3f79c15-72d0-4e3a-b8d1-9f2ca3e81054").expect("valid UUID must parse");
         assert_eq!(uuid.timeLow, 0xa3f79c15);
         assert_eq!(uuid.timeMid, 0x72d0);
         assert_eq!(uuid.timeHiAndVersion, 0x4e3a);
-        assert_eq!(uuid.clockSeqAndNode, [0xb8, 0xd1, 0x9f, 0x2c, 0xa3, 0xe8, 0x10, 0x54]);
+        assert_eq!(
+            uuid.clockSeqAndNode,
+            [0xb8, 0xd1, 0x9f, 0x2c, 0xa3, 0xe8, 0x10, 0x54]
+        );
     }
 
     #[test]

@@ -175,10 +175,7 @@ mod tests {
 
     #[test]
     fn content_length_case_insensitive() {
-        let req = parse(
-            b"POST / HTTP/1.1\r\ncontent-length: 2\r\n\r\nok",
-        )
-        .unwrap();
+        let req = parse(b"POST / HTTP/1.1\r\ncontent-length: 2\r\n\r\nok").unwrap();
         assert_eq!(req.content_length, 2);
         assert_eq!(req.body, b"ok");
     }
@@ -187,10 +184,7 @@ mod tests {
     fn malformed_content_length_silently_falls_to_zero() {
         // `parse::<usize>().ok()` swallows errors by design. Phase 2
         // hardening can tighten; until then this is deliberate.
-        let req = parse(
-            b"POST / HTTP/1.1\r\nContent-Length: not-a-number\r\n\r\n",
-        )
-        .unwrap();
+        let req = parse(b"POST / HTTP/1.1\r\nContent-Length: not-a-number\r\n\r\n").unwrap();
         assert_eq!(req.content_length, 0);
     }
 

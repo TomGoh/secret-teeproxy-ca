@@ -99,12 +99,7 @@ impl MockTeec {
     /// least `bytes.len()` bytes — if the provided buffer is smaller,
     /// `mutate` writes only as many bytes as fit and updates
     /// `tmpref.size` accordingly (matches TA short-write semantics).
-    pub fn queue_blob_and_biz(
-        &mut self,
-        cmd_id: u32,
-        biz_code: u32,
-        bytes: Vec<u8>,
-    ) -> &mut Self {
+    pub fn queue_blob_and_biz(&mut self, cmd_id: u32, biz_code: u32, bytes: Vec<u8>) -> &mut Self {
         self.queue(ScriptedResponse {
             expected_cmd_id: Some(cmd_id),
             rc: raw::TEEC_SUCCESS,
@@ -158,8 +153,7 @@ mod tests {
     #[test]
     fn records_cmd_ids_in_order() {
         let mut mock = MockTeec::new();
-        mock.queue_biz(0x0004, 0x900D)
-            .queue_biz(0x0007, 0x900D);
+        mock.queue_biz(0x0004, 0x900D).queue_biz(0x0007, 0x900D);
 
         let mut op = zeroed_op();
         op.paramTypes = raw::TEEC_PARAM_TYPES(

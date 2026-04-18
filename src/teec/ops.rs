@@ -132,10 +132,7 @@ pub(crate) fn teec_remove_key(teec: &mut dyn Teec, slot: u32) -> Result<(), Stri
 /// Add a URL prefix pattern to the TA's whitelist via
 /// `CMD_ADD_WHITELIST` (0x0005). The TA matches
 /// `endpoint_url.starts_with(pattern)` — prefix match, not glob.
-pub(crate) fn teec_add_whitelist(
-    teec: &mut dyn Teec,
-    pattern: &str,
-) -> Result<(), String> {
+pub(crate) fn teec_add_whitelist(teec: &mut dyn Teec, pattern: &str) -> Result<(), String> {
     let payload = AddWhitelistPayload {
         pattern: pattern.to_string(),
     };
@@ -352,10 +349,7 @@ mod tests {
 
     #[test]
     fn ta_error_layer_classifies_ca_parse() {
-        assert_eq!(
-            ta_error_layer("failed to parse slot list: EOF"),
-            "ca_parse"
-        );
+        assert_eq!(ta_error_layer("failed to parse slot list: EOF"), "ca_parse");
     }
 
     #[test]

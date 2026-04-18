@@ -5,7 +5,13 @@ edition = "2021"
 license = "Apache-2.0"
 
 [dependencies]
-cc_teec = { package = "rust-libteec", path = "../../rust-libteec" }
+# rust-libteec (exposed as `cc_teec`) is the GP TEE Client API crate.
+# Pulled directly from gitee so this repo builds standalone — no need
+# to sit inside the `openclaw-security-enhanced` parent. If a local
+# sibling checkout is preferred during development, add a
+# `[patch.crates-io]` or `[patch."https://gitee.com/..."]` section in
+# `.cargo/config.toml` (kept out of version control).
+cc_teec = { package = "rust-libteec", git = "https://gitee.com/jose47/rust-libteec.git", branch = "feat/android-vsock-cid" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = "1"
@@ -20,6 +26,15 @@ libc = "0.2"
 # Keeps Result<T, String> compatible via a From<Error> for String bridge
 # (see src/error.rs) so migration can proceed incrementally.
 thiserror = "1"
+
+[dev-dependencies]
+# Property-based testing — used for systematic exploration of the
+# `ChunkedDecoder` (random split points against a naive reference
+# oracle) and the `relay::core` state machine (random TA scripts
+# verifying invariants like "no ToUpstream with empty bytes", "pump
+# debounce is single-shot", etc.). Dev-only; never in production
+# builds.
+proptest = "1"
 
 [features]
 # Expose test-only mocks (`teec::mock::MockTeec`,

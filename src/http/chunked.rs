@@ -120,10 +120,7 @@ impl ChunkedDecoder {
             }
 
             // Looking for a chunk size line: hex digits followed by \r\n.
-            let line_end = match self.pending[pos..]
-                .windows(2)
-                .position(|w| w == b"\r\n")
-            {
+            let line_end = match self.pending[pos..].windows(2).position(|w| w == b"\r\n") {
                 Some(p) => pos + p,
                 None => break, // incomplete size line — wait for next feed
             };
@@ -279,7 +276,10 @@ mod tests {
         let mut d = ChunkedDecoder::new();
         let out1 = d.feed(b"b\r\nHELL"); // chunk_size=11, only 4 payload bytes arrived
         assert_eq!(out1, b"HELL");
-        assert!(d.chunk_remaining > 0, "decoder must carry state across feeds");
+        assert!(
+            d.chunk_remaining > 0,
+            "decoder must carry state across feeds"
+        );
         let out2 = d.feed(b"O WORLD\r\n0\r\n\r\n");
         assert_eq!(out2, b"O WORLD");
     }
@@ -370,10 +370,10 @@ mod tests {
         let payloads: Vec<&[u8]> = vec![
             b"hello",
             b"a",
-            b"",                        // zero-length data chunks are legal (but will terminate)
+            b"", // zero-length data chunks are legal (but will terminate)
             b"a much longer payload string",
             b"foo\r\nbar",
-            b"\x00\x01\x02\x03",        // binary content
+            b"\x00\x01\x02\x03", // binary content
         ];
         // Filter out the empty payload: a chunk with size=0 would be
         // interpreted as the terminator mid-stream, breaking reassembly.
@@ -398,5 +398,89 @@ mod tests {
         assert_eq!(d.feed(b"3\r\nabc\r\n0\r\n\r\n"), b"abc");
         // Further feed: should not panic.
         let _ = d.feed(b"extra garbage");
+    }
+
+    // ================================================================
+    // Proptest — systematic exploration against the encode_chunked
+    // reference oracle. Each proptest run generates random payloads
+    // + random split points and asserts the decoder reassembles the
+    // original byte-for-byte. Catches edge cases the hand-rolled
+    // tests might miss (split inside hex size line, split inside
+    // CRLF, etc.).
+    // ================================================================
+    proptest::proptest! {
+        /// For any valid chunked stream and any single split point,
+        /// `feed(part1); feed(part2)` must reproduce the concatenation
+        /// of the original payloads byte-for-byte.
+        #[test]
+        fn prop_decoder_reassembles_across_any_split(
+            // 1..=8 non-empty chunks, each 1..=64 bytes of arbitrary
+            // content (including CRLF, null bytes, hex-like payloads
+            // — all things that could confuse a naive parser).
+            payloads in proptest::collection::vec(
+                proptest::collection::vec(proptest::num::u8::ANY, 1..=64),
+                1..=8,
+            ),
+            // Split point is normalized to the actual encoded length
+            // inside the test body (proptest strategies can't
+            // cross-reference).
+            split_numerator in 0usize..1000,
+        ) {
+            let payload_refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+            let encoded = encode_chunked(&payload_refs);
+            let expected: Vec<u8> = payload_refs.iter().flat_map(|p| p.iter().copied()).collect();
+
+            // Map split_numerator (0..1000) to 1..encoded.len() so we
+            // always split (not entirely at start or end).
+            if encoded.len() < 2 { return Ok(()); }
+            let split = 1 + (split_numerator % (encoded.len() - 1));
+
+            let mut d = ChunkedDecoder::new();
+            let mut got = d.feed(&encoded[..split]);
+            got.extend_from_slice(&d.feed(&encoded[split..]));
+
+            let msg = format!(
+                "split={}, encoded.len()={}, payload count={}",
+                split, encoded.len(), payload_refs.len(),
+            );
+            proptest::prop_assert_eq!(got, expected, "{}", msg);
+        }
+
+        /// Even-finer split: feed the stream byte-by-byte.
+        /// Stress-tests the `pending` buffer state machine for any
+        /// possible carry across reads.
+        #[test]
+        fn prop_decoder_reassembles_byte_by_byte(
+            payloads in proptest::collection::vec(
+                proptest::collection::vec(proptest::num::u8::ANY, 1..=32),
+                1..=4,
+            ),
+        ) {
+            let payload_refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+            let encoded = encode_chunked(&payload_refs);
+            let expected: Vec<u8> = payload_refs.iter().flat_map(|p| p.iter().copied()).collect();
+
+            let mut d = ChunkedDecoder::new();
+            let mut got = Vec::new();
+            for b in &encoded {
+                got.extend_from_slice(&d.feed(&[*b]));
+            }
+
+            proptest::prop_assert_eq!(got, expected);
+        }
+
+        /// Random garbage input: decoder must not panic. Lenient-mode
+        /// behavior lets arbitrary bytes flow through as raw output,
+        /// but the function must terminate and never unwind.
+        #[test]
+        fn prop_decoder_never_panics_on_garbage(
+            garbage in proptest::collection::vec(proptest::num::u8::ANY, 0..=1024),
+        ) {
+            let mut d = ChunkedDecoder::new();
+            let _ = d.feed(&garbage);
+            // Don't assert on output shape — Lenient fallback is
+            // intentionally "garbage in → garbage out". The
+            // property is: we returned, did not panic.
+        }
     }
 }

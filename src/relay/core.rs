@@ -46,9 +46,7 @@
 //! of "realistic trace" tests that drive a CONTINUE→PUMP→STREAMING→DONE
 //! sequence representing a full relay round.
 
-use crate::constants::{
-    BIZ_RELAY_CONTINUE, BIZ_RELAY_DONE, BIZ_RELAY_STREAMING, BIZ_RELAY_START,
-};
+use crate::constants::{BIZ_RELAY_CONTINUE, BIZ_RELAY_DONE, BIZ_RELAY_START, BIZ_RELAY_STREAMING};
 use crate::http::chunked::ChunkedDecoder;
 
 /// One TA CMD_RELAY_DATA response, decoupled from the FFI-level
@@ -447,7 +445,12 @@ mod tests {
         let out = step(ta(BIZ_RELAY_STREAMING, payload, b""), &mut state);
 
         // First event must be StartStreamingResponse{200}.
-        assert_eq!(out.events[0], RelayEvent::StartStreamingResponse { upstream_status: 200 });
+        assert_eq!(
+            out.events[0],
+            RelayEvent::StartStreamingResponse {
+                upstream_status: 200
+            }
+        );
         // Then the initial body bytes (everything after \r\n\r\n).
         let body_start = payload.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
         assert_eq!(
@@ -470,7 +473,9 @@ mod tests {
         let out = step(ta(BIZ_RELAY_STREAMING, payload, b""), &mut state);
         assert_eq!(
             out.events[0],
-            RelayEvent::StartStreamingResponse { upstream_status: 429 }
+            RelayEvent::StartStreamingResponse {
+                upstream_status: 429
+            }
         );
     }
 
@@ -528,7 +533,10 @@ mod tests {
     fn streaming_subsequent_chunk_emits_body_and_flush_only() {
         let mut state = RelayState::new();
         state.response_started = true;
-        let out = step(ta(BIZ_RELAY_STREAMING, b"data: {\"x\":1}\n\n", b""), &mut state);
+        let out = step(
+            ta(BIZ_RELAY_STREAMING, b"data: {\"x\":1}\n\n", b""),
+            &mut state,
+        );
         assert_eq!(
             out.events[0],
             RelayEvent::ClientBody(b"data: {\"x\":1}\n\n".to_vec())
@@ -547,7 +555,10 @@ mod tests {
         );
         // Body + flush + upstream ACK — in that order.
         assert_eq!(out.events.len(), 3);
-        assert_eq!(out.events[0], RelayEvent::ClientBody(b"data: x\n\n".to_vec()));
+        assert_eq!(
+            out.events[0],
+            RelayEvent::ClientBody(b"data: x\n\n".to_vec())
+        );
         assert_eq!(out.events[1], RelayEvent::FlushClient);
         assert_eq!(out.events[2], RelayEvent::ToUpstream(b"TLSACK".to_vec()));
     }
@@ -582,7 +593,11 @@ mod tests {
             .next()
             .unwrap_or_default();
 
-        let combined: Vec<u8> = round1_body.iter().chain(round2_body.iter()).copied().collect();
+        let combined: Vec<u8> = round1_body
+            .iter()
+            .chain(round2_body.iter())
+            .copied()
+            .collect();
         assert_eq!(
             combined,
             b"Hello".to_vec(),
@@ -625,14 +640,16 @@ mod tests {
             body_bytes.to_vec(),
         );
         let mut state = RelayState::new();
-        let out = step(
-            ta(BIZ_RELAY_DONE, resp_json.as_bytes(), b""),
-            &mut state,
-        );
+        let out = step(ta(BIZ_RELAY_DONE, resp_json.as_bytes(), b""), &mut state);
 
         assert_eq!(out.next, RelayNext::Done);
         let full = out.events.iter().find_map(|e| {
-            if let RelayEvent::ClientFullResponse { status, content_type, body } = e {
+            if let RelayEvent::ClientFullResponse {
+                status,
+                content_type,
+                body,
+            } = e
+            {
                 Some((*status, content_type.clone(), body.clone()))
             } else {
                 None
@@ -648,10 +665,7 @@ mod tests {
     fn done_short_response_missing_content_type_defaults_to_json() {
         let resp_json = r#"{"status":200,"headers":{},"body":[]}"#;
         let mut state = RelayState::new();
-        let out = step(
-            ta(BIZ_RELAY_DONE, resp_json.as_bytes(), b""),
-            &mut state,
-        );
+        let out = step(ta(BIZ_RELAY_DONE, resp_json.as_bytes(), b""), &mut state);
         let ct = out.events.iter().find_map(|e| {
             if let RelayEvent::ClientFullResponse { content_type, .. } = e {
                 Some(content_type.clone())
@@ -668,10 +682,7 @@ mod tests {
         // round — openclaw must see 401, not a falsified 200.
         let resp_json = r#"{"status":401,"headers":{"content-type":"text/plain"},"body":[117,110,97,117,116,104]}"#;
         let mut state = RelayState::new();
-        let out = step(
-            ta(BIZ_RELAY_DONE, resp_json.as_bytes(), b""),
-            &mut state,
-        );
+        let out = step(ta(BIZ_RELAY_DONE, resp_json.as_bytes(), b""), &mut state);
         let status = out.events.iter().find_map(|e| {
             if let RelayEvent::ClientFullResponse { status, .. } = e {
                 Some(*status)
@@ -685,10 +696,7 @@ mod tests {
     #[test]
     fn done_short_response_bad_json_emits_error() {
         let mut state = RelayState::new();
-        let out = step(
-            ta(BIZ_RELAY_DONE, b"not-json-at-all", b""),
-            &mut state,
-        );
+        let out = step(ta(BIZ_RELAY_DONE, b"not-json-at-all", b""), &mut state);
         assert!(out.events.is_empty());
         match out.next {
             RelayNext::Error(msg) => assert!(msg.contains("parse ProxyResponse")),
@@ -703,10 +711,7 @@ mod tests {
         // by `!response_started`.
         let mut state = RelayState::new();
         state.response_started = true;
-        let out = step(
-            ta(BIZ_RELAY_DONE, b"{\"status\":200}", b""),
-            &mut state,
-        );
+        let out = step(ta(BIZ_RELAY_DONE, b"{\"status\":200}", b""), &mut state);
         // Only a flush; no ClientFullResponse, no Error.
         assert_eq!(out.events, vec![RelayEvent::FlushClient]);
         assert_eq!(out.next, RelayNext::Done);
@@ -770,14 +775,13 @@ mod tests {
         assert_eq!(o4.next, RelayNext::ReadUpstream);
         assert!(matches!(
             o4.events[0],
-            RelayEvent::StartStreamingResponse { upstream_status: 200 }
+            RelayEvent::StartStreamingResponse {
+                upstream_status: 200
+            }
         ));
 
         // 5
-        let o5 = step(
-            ta(BIZ_RELAY_STREAMING, b"data: b\n\n", b""),
-            &mut state,
-        );
+        let o5 = step(ta(BIZ_RELAY_STREAMING, b"data: b\n\n", b""), &mut state);
         assert_eq!(o5.next, RelayNext::ReadUpstream);
         assert_eq!(
             o5.events[0],
@@ -813,5 +817,172 @@ mod tests {
         let data = b"HTTP/1.1 200 OK\r\n";
         let (_, off) = parse_upstream_headers(data);
         assert_eq!(off, data.len());
+    }
+
+    // ================================================================
+    // Proptest — systematic exploration of random TA output sequences.
+    // Complements the 26 hand-rolled tests above by verifying
+    // state-machine invariants that hold for ANY input combination,
+    // not just the specific ones we thought to test.
+    // ================================================================
+    use proptest::prelude::*;
+
+    proptest::proptest! {
+        /// Pump debounce invariant: after `PumpTa` is emitted, the
+        /// NEXT step() call must NOT emit `PumpTa` regardless of TA
+        /// response. Cascading pumps would deadlock when rustls
+        /// genuinely has nothing to send.
+        #[test]
+        fn prop_pump_never_cascades(
+            first_decrypted_empty in proptest::bool::ANY,
+            first_tls_extra_len in 0usize..32,
+            second_decrypted_len in 0usize..32,
+            second_tls_extra_len in 0usize..32,
+        ) {
+            let first_decrypted = if first_decrypted_empty { vec![] } else { vec![b'X'; 4] };
+            let first_tls = vec![b'T'; first_tls_extra_len];
+            let mut state = RelayState::new();
+
+            let out1 = step(
+                RelayTaOutput {
+                    biz_code: BIZ_RELAY_CONTINUE,
+                    decrypted: &first_decrypted,
+                    tls_extra: &first_tls,
+                },
+                &mut state,
+            );
+
+            if out1.next == RelayNext::PumpTa {
+                let second_decrypted = vec![b'Y'; second_decrypted_len];
+                let second_tls = vec![b'U'; second_tls_extra_len];
+
+                let out2 = step(
+                    RelayTaOutput {
+                        biz_code: BIZ_RELAY_CONTINUE,
+                        decrypted: &second_decrypted,
+                        tls_extra: &second_tls,
+                    },
+                    &mut state,
+                );
+                proptest::prop_assert_ne!(out2.next, RelayNext::PumpTa);
+            }
+        }
+
+        /// Invariant: `ToUpstream` events never carry empty byte
+        /// vectors. Empty writes waste a syscall on the adapter side
+        /// and every call site expects non-trivial payloads.
+        #[test]
+        fn prop_to_upstream_never_empty(
+            biz_selector in 0usize..3,
+            decrypted_len in 0usize..64,
+            tls_extra_len in 0usize..32,
+        ) {
+            let biz_code = match biz_selector {
+                0 => BIZ_RELAY_CONTINUE,
+                1 => BIZ_RELAY_STREAMING,
+                _ => BIZ_RELAY_DONE,
+            };
+            let decrypted = vec![b'D'; decrypted_len];
+            let tls_extra = vec![b'T'; tls_extra_len];
+            let mut state = RelayState::new();
+
+            let outcome = step(
+                RelayTaOutput { biz_code, decrypted: &decrypted, tls_extra: &tls_extra },
+                &mut state,
+            );
+            for ev in &outcome.events {
+                if let RelayEvent::ToUpstream(bytes) = ev {
+                    let msg = format!("ToUpstream emitted with empty bytes for biz=0x{:04x}", biz_code);
+                    proptest::prop_assert!(!bytes.is_empty(), "{}", msg);
+                }
+            }
+        }
+
+        /// `StartStreamingResponse` fires exactly once per session.
+        /// Subsequent STREAMING rounds emit only `ClientBody` +
+        /// `FlushClient` (+ maybe `ToUpstream` for tls_extra).
+        #[test]
+        fn prop_preamble_fires_exactly_once(
+            n_streaming_rounds in 1usize..6,
+        ) {
+            let mut state = RelayState::new();
+            let chunk = b"HTTP/1.1 200 OK\r\n\r\ndata: event\n\n";
+            let mut preamble_count = 0;
+
+            for _ in 0..n_streaming_rounds {
+                let outcome = step(
+                    RelayTaOutput {
+                        biz_code: BIZ_RELAY_STREAMING,
+                        decrypted: chunk,
+                        tls_extra: &[],
+                    },
+                    &mut state,
+                );
+                preamble_count += outcome.events.iter()
+                    .filter(|e| matches!(e, RelayEvent::StartStreamingResponse { .. }))
+                    .count();
+            }
+
+            proptest::prop_assert_eq!(preamble_count, 1);
+        }
+
+        /// `RelayNext::Done` always reached via BIZ_RELAY_DONE once
+        /// streaming has started, regardless of prior pump / chunked
+        /// state. (The non-streaming short-response path is excluded
+        /// because it tries serde on decrypted and errors on garbage.)
+        #[test]
+        fn prop_done_always_terminates_mid_stream(
+            pre_pump_waiting in proptest::bool::ANY,
+            pre_chunked in proptest::bool::ANY,
+            done_tls_extra_len in 0usize..32,
+        ) {
+            let mut state = RelayState {
+                response_started: true, // post-streaming
+                upstream_is_chunked: pre_chunked,
+                chunked_decoder: crate::http::chunked::ChunkedDecoder::new(),
+                waiting_for_pump: pre_pump_waiting,
+            };
+            let tls_extra = vec![b'C'; done_tls_extra_len];
+
+            let outcome = step(
+                RelayTaOutput {
+                    biz_code: BIZ_RELAY_DONE,
+                    decrypted: &[],
+                    tls_extra: &tls_extra,
+                },
+                &mut state,
+            );
+            proptest::prop_assert_eq!(outcome.next, RelayNext::Done);
+        }
+
+        /// Unknown `biz_code` always produces the exact pytest-pinned
+        /// error string `"relay error: 0x{:04x}"`. Any silent reword
+        /// would break `tests/format/` without a compile error.
+        #[test]
+        fn prop_unknown_biz_code_produces_exact_error_string(
+            biz in proptest::num::u32::ANY
+                .prop_filter("must not collide with known biz codes", |b| {
+                    ![BIZ_RELAY_CONTINUE, BIZ_RELAY_STREAMING, BIZ_RELAY_DONE, BIZ_RELAY_START]
+                        .contains(b)
+                }),
+        ) {
+            let mut state = RelayState::new();
+            let outcome = step(
+                RelayTaOutput { biz_code: biz, decrypted: &[], tls_extra: &[] },
+                &mut state,
+            );
+
+            match outcome.next {
+                RelayNext::Error(msg) => {
+                    let expected = format!("relay error: 0x{:04x}", biz);
+                    proptest::prop_assert_eq!(msg, expected);
+                }
+                other => {
+                    return Err(proptest::test_runner::TestCaseError::fail(
+                        format!("expected Error, got {:?}", other),
+                    ));
+                }
+            }
+        }
     }
 }

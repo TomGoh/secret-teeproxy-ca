@@ -34,7 +34,10 @@ pub fn header_value(headers_block: &str, name_lc: &str) -> Option<String> {
     for line in headers_block.lines() {
         let lower = line.to_lowercase();
         if lower.starts_with(&prefix) {
-            return line.splitn(2, ':').nth(1).map(|s| s.trim().to_string());
+            return line
+                .split_once(':')
+                .map(|x| x.1)
+                .map(|s| s.trim().to_string());
         }
     }
     None
@@ -101,7 +104,10 @@ mod tests {
     #[test]
     fn header_value_case_insensitive() {
         let block = "Host: example.com\r\nX-Admin-Token: abc\r\nUser-Agent: test";
-        assert_eq!(header_value(block, "x-admin-token"), Some("abc".to_string()));
+        assert_eq!(
+            header_value(block, "x-admin-token"),
+            Some("abc".to_string())
+        );
         // Case of header NAME in the block doesn't matter; only the lookup lowercase.
         assert_eq!(header_value(block, "host"), Some("example.com".to_string()));
     }
@@ -123,7 +129,10 @@ mod tests {
         // RFC 7230: field-value may contain a colon. Only the *first* colon
         // separates name from value.
         let block = "X-Trace: abc:def:ghi";
-        assert_eq!(header_value(block, "x-trace"), Some("abc:def:ghi".to_string()));
+        assert_eq!(
+            header_value(block, "x-trace"),
+            Some("abc:def:ghi".to_string())
+        );
     }
 
     #[test]

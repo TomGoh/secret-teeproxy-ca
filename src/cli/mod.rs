@@ -11,9 +11,7 @@ pub mod diagnostics;
 use log::error;
 
 use crate::constants::TA_UUID;
-use crate::teec::ops::{
-    teec_add_whitelist, teec_list_slots, teec_provision_key, teec_remove_key,
-};
+use crate::teec::ops::{teec_add_whitelist, teec_list_slots, teec_provision_key, teec_remove_key};
 use crate::teec::{RealTeec, Teec};
 use crate::wire::ProvisionKeyPayload;
 
@@ -85,7 +83,11 @@ fn cmd_provision_key(teec: &mut dyn Teec, args: &[String]) -> Result<(), String>
     let key = parse_arg_str(args, "--key")?;
     let provider = parse_arg_str(args, "--provider")?;
 
-    let payload = ProvisionKeyPayload { slot, key, provider };
+    let payload = ProvisionKeyPayload {
+        slot,
+        key,
+        provider,
+    };
     teec_provision_key(teec, &payload)?;
     println!("Key provisioned in slot {slot}");
     Ok(())
@@ -149,7 +151,9 @@ fn print_usage(prog: &str) {
     eprintln!();
     eprintln!("Logging: set RUST_LOG=debug for verbose relay details.");
     eprintln!();
-    eprintln!("serve: GET /health (TEEC+TA probe, no auth); admin API: set SECRET_PROXY_CA_ADMIN_TOKEN");
+    eprintln!(
+        "serve: GET /health (TEEC+TA probe, no auth); admin API: set SECRET_PROXY_CA_ADMIN_TOKEN"
+    );
     eprintln!("  X-Admin-Token for GET /admin/keys/slots and POST /admin/keys/provision");
 }
 

@@ -14,17 +14,12 @@ use cc_teec::raw;
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    check_teec_rc,
-    ta_error_layer, teec_list_slots, teec_list_slots_meta, teec_provision_key, teec_remove_key,
-    ProvisionKeyPayload,
-    SlotEntry,
-    CMD_PROXY_REQUEST,
-    BIZ_RELAY_START,
-    HttpMethod, ProxyRequest,
-    ADMIN_ACTOR_HEADER, ADMIN_REQUEST_ID_HEADER,
-};
 use crate::teec::Teec;
+use crate::{
+    check_teec_rc, ta_error_layer, teec_list_slots, teec_list_slots_meta, teec_provision_key,
+    teec_remove_key, HttpMethod, ProvisionKeyPayload, ProxyRequest, SlotEntry, ADMIN_ACTOR_HEADER,
+    ADMIN_REQUEST_ID_HEADER, BIZ_RELAY_START, CMD_PROXY_REQUEST,
+};
 
 #[derive(Clone, Debug)]
 struct AdminAuditContext {
@@ -154,10 +149,7 @@ struct HealthTa {
 }
 
 /// Handle one HTTP connection: read request, optional admin API, or TEEC relay + SSE.
-pub(crate) fn handle_connection(
-    teec: &mut dyn Teec,
-    mut client: TcpStream,
-) -> Result<(), String> {
+pub(crate) fn handle_connection(teec: &mut dyn Teec, mut client: TcpStream) -> Result<(), String> {
     let mut reader = BufReader::new(&client);
     let req = crate::http::request::parse_request(&mut reader)?;
     let http_method = req.method;
@@ -219,7 +211,11 @@ pub(crate) fn handle_connection(
     // --- Admin API (same TEEC session as proxy) ---
     if path == "/admin/keys/slots" && http_method == "GET" {
         if let Err(reason) = check_admin_token(&headers_text) {
-            let status = if reason.contains("disabled") { 503 } else { 401 };
+            let status = if reason.contains("disabled") {
+                503
+            } else {
+                401
+            };
             let text = if status == 503 {
                 "Service Unavailable"
             } else {
@@ -273,7 +269,11 @@ pub(crate) fn handle_connection(
         }
     } else if path == "/admin/keys/provision" && http_method == "POST" {
         if let Err(reason) = check_admin_token(&headers_text) {
-            let status = if reason.contains("disabled") { 503 } else { 401 };
+            let status = if reason.contains("disabled") {
+                503
+            } else {
+                401
+            };
             let text = if status == 503 {
                 "Service Unavailable"
             } else {
@@ -370,7 +370,11 @@ pub(crate) fn handle_connection(
         }
     } else if path == "/admin/keys/remove" && http_method == "POST" {
         if let Err(reason) = check_admin_token(&headers_text) {
-            let status = if reason.contains("disabled") { 503 } else { 401 };
+            let status = if reason.contains("disabled") {
+                503
+            } else {
+                401
+            };
             let text = if status == 503 {
                 "Service Unavailable"
             } else {
@@ -464,7 +468,9 @@ fn handle_proxy_post(
     let incoming: IncomingProxyRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
-            let error_body = format!("{{\"error\":{{\"message\":\"invalid JSON: {e}\",\"type\":\"proxy_error\"}}}}");
+            let error_body = format!(
+                "{{\"error\":{{\"message\":\"invalid JSON: {e}\",\"type\":\"proxy_error\"}}}}"
+            );
             let response = format!(
                 "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 error_body.len(), error_body
@@ -488,7 +494,10 @@ fn handle_proxy_post(
 
     info!(
         "serve → {} {} (key_id={}, body={} bytes)",
-        incoming.method, incoming.endpoint_url, incoming.key_id, incoming.body.len()
+        incoming.method,
+        incoming.endpoint_url,
+        incoming.key_id,
+        incoming.body.len()
     );
 
     // Summarize the request body for operators. openclaw replays the
@@ -504,10 +513,16 @@ fn handle_proxy_post(
     // `SecretProxyRequest.headers`. Inject both headers if missing
     // so wrappers can omit them safely.
     let mut req_headers = incoming.headers;
-    if !req_headers.keys().any(|k| k.to_lowercase() == "anthropic-version") {
+    if !req_headers
+        .keys()
+        .any(|k| k.to_lowercase() == "anthropic-version")
+    {
         req_headers.insert("anthropic-version".into(), "2023-06-01".into());
     }
-    if !req_headers.keys().any(|k| k.to_lowercase() == "content-type") {
+    if !req_headers
+        .keys()
+        .any(|k| k.to_lowercase() == "content-type")
+    {
         req_headers.insert("Content-Type".into(), "application/json".into());
     }
 
@@ -532,8 +547,7 @@ fn handle_proxy_post(
         body_base64: Some(body_b64),
     };
 
-    let mut json = serde_json::to_vec(&req)
-        .map_err(|e| format!("serialize ProxyRequest: {e}"))?;
+    let mut json = serde_json::to_vec(&req).map_err(|e| format!("serialize ProxyRequest: {e}"))?;
     debug!("ProxyRequest JSON size: {} bytes", json.len());
 
     // CMD_PROXY_REQUEST: param[0] = JSON in, param[1] = biz out,
@@ -627,8 +641,12 @@ fn send_error(client: &mut TcpStream, status: u16, message: &str) {
 /// for forensics. This avoids the quadratic INFO-log growth that
 /// happens when openclaw replays the whole chat each turn.
 fn log_request_preview(body: &[u8]) {
-    let Ok(body_str) = std::str::from_utf8(body) else { return };
-    let Ok(body_json) = serde_json::from_str::<serde_json::Value>(body_str) else { return };
+    let Ok(body_str) = std::str::from_utf8(body) else {
+        return;
+    };
+    let Ok(body_json) = serde_json::from_str::<serde_json::Value>(body_str) else {
+        return;
+    };
 
     let model = body_json
         .get("model")
@@ -684,7 +702,7 @@ fn extract_message_text(msg: &serde_json::Value) -> String {
 fn truncate_chars(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max).collect();
     if s.chars().count() > max {
-        out.push_str("…");
+        out.push('…');
     }
     out
 }

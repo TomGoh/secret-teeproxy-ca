@@ -61,9 +61,7 @@ pub fn check_admin_token_with_env(
         Some(t) if !t.is_empty() => t,
         _ => return Err("admin API disabled (set SECRET_PROXY_CA_ADMIN_TOKEN)"),
     };
-    let expected_prev = env
-        .get(ADMIN_TOKEN_PREV_ENV)
-        .filter(|t| !t.is_empty());
+    let expected_prev = env.get(ADMIN_TOKEN_PREV_ENV).filter(|t| !t.is_empty());
 
     let provided = header_value(headers_block, "x-admin-token").unwrap_or_default();
     let current_match = constant_time_equal(&provided, &expected);
@@ -171,8 +169,7 @@ mod tests {
         let old_tok = "b".repeat(32);
         let env = MockEnv::new().with(ADMIN_TOKEN_ENV, &new_tok);
         // No PREV set.
-        let err =
-            check_admin_token_with_env(&headers_with_token(&old_tok), &env).unwrap_err();
+        let err = check_admin_token_with_env(&headers_with_token(&old_tok), &env).unwrap_err();
         assert_eq!(err, "invalid admin token");
     }
 
@@ -199,8 +196,7 @@ mod tests {
         let tok = "x".repeat(32);
         let short = "x".repeat(31);
         let env = MockEnv::new().with(ADMIN_TOKEN_ENV, &tok);
-        let err =
-            check_admin_token_with_env(&headers_with_token(&short), &env).unwrap_err();
+        let err = check_admin_token_with_env(&headers_with_token(&short), &env).unwrap_err();
         assert_eq!(err, "invalid admin token");
     }
 

@@ -1,0 +1,115 @@
+name: CI
+
+# Triggered on every push to main and on every PR.
+# Designed to run in under 3 minutes on a standard Linux runner —
+# no device, no MiniMax key, no openclaw dependency. All tests are
+# hermetic (`test-support` feature + MockTeec + MockUpstream).
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail on any warning — catches accidental import bloat, dead code,
+  # deprecated API usage before it lands on main.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # -------------------------------------------------------------------
+  # Fast feedback: fmt + clippy + build. Runs before the test job so a
+  # typo-level failure surfaces in ~30s instead of waiting for the
+  # mbedtls-smx compile (the slowest dep in our tree).
+  # -------------------------------------------------------------------
+  lint:
+    name: lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        # --features test-support exercises the mock + integration
+        # test paths; clippy on default features alone would miss
+        # lints in the test-only code.
+        run: cargo clippy --all-targets --features test-support -- -D warnings
+
+  # -------------------------------------------------------------------
+  # Main test matrix: unit tests (174) + proptest (8 × ~256 cases each)
+  # + integration tests (8) = ~190 deterministic assertions +
+  # ~2000 randomly-explored proptest cases per CI run.
+  # -------------------------------------------------------------------
+  test:
+    name: test (unit + proptest + integration)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        # `--features test-support` enables MockTeec/MockUpstream/MockClock
+        # and pulls in the integration tests under tests/.
+        run: cargo test --features test-support --all-targets -- --nocapture
+      - name: doc tests
+        run: cargo test --doc
+
+  # -------------------------------------------------------------------
+  # Android cross-compile — verifies the production build target
+  # (aarch64-linux-android, Bionic libc via NDK) still links every
+  # time. Optional job; doesn't gate the PR but catches "works on
+  # Linux but breaks on NDK" regressions early.
+  # -------------------------------------------------------------------
+  build-android:
+    name: android cross-compile (arm64-v8a)
+    runs-on: ubuntu-latest
+    # Don't block PR merges on Android build flakes. This job's value
+    # is "tell us quickly if the production target is broken" — not
+    # "gate every PR on NDK being available in CI".
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+      - name: Build release binary
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        # -P 29 = Android API level 29 (matches scripts/build-ca-android.sh)
+        run: cargo ndk -t arm64-v8a -P 29 build --release --bin secret_proxy_ca
+      - name: Verify binary shape
+        run: file target/aarch64-linux-android/release/secret_proxy_ca
+
+  # -------------------------------------------------------------------
+  # Coverage measurement. Runs the same test command as the `test` job
+  # but through `cargo llvm-cov`. Posts a summary on the PR; doesn't
+  # fail on coverage drop (yet) — we'll ratchet thresholds once we
+  # have a baseline.
+  # -------------------------------------------------------------------
+  coverage:
+    name: coverage (llvm-cov)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Run coverage
+        run: cargo llvm-cov --features test-support --all-targets --summary-only

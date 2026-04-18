@@ -1,3 +1,11 @@
+// Clippy lint opt-outs: the rest of the crate follows default lints.
+// These two are markdown-formatting lints against existing doc
+// comments — disabled crate-wide so CI's `-D warnings` gate doesn't
+// trip on cosmetic nits. Revisit if someone wants to do a docstring
+// pass.
+#![allow(clippy::doc_overindented_list_items)]
+#![allow(clippy::doc_lazy_continuation)]
+
 //! secret_proxy_ca — Client Application for SecretProxyTA.
 //!
 //! Communicates with SecretProxyTA via the GP TEE Client API
@@ -68,6 +76,4 @@ pub(crate) use teec::ops::{
     teec_remove_key,
 };
 #[allow(unused_imports)]
-pub(crate) use wire::{
-    HttpMethod, ProvisionKeyPayload, ProxyRequest, ProxyResponse, SlotEntry,
-};
+pub(crate) use wire::{HttpMethod, ProvisionKeyPayload, ProxyRequest, ProxyResponse, SlotEntry};

@@ -21,12 +21,12 @@ pub const TA_UUID: &str = "a3f79c15-72d0-4e3a-b8d1-9f2ca3e81054";
 // Must match the constants in `secret_proxy_ta/src/main.rs`.
 // ---------------------------------------------------------------------------
 
-pub const CMD_PROXY_REQUEST:   u32 = 0x0001;
-pub const CMD_PROVISION_KEY:   u32 = 0x0002;
-pub const CMD_REMOVE_KEY:      u32 = 0x0003;
-pub const CMD_LIST_SLOTS:      u32 = 0x0004;
-pub const CMD_ADD_WHITELIST:   u32 = 0x0005;
-pub const CMD_RELAY_DATA:      u32 = 0x0006;
+pub const CMD_PROXY_REQUEST: u32 = 0x0001;
+pub const CMD_PROVISION_KEY: u32 = 0x0002;
+pub const CMD_REMOVE_KEY: u32 = 0x0003;
+pub const CMD_LIST_SLOTS: u32 = 0x0004;
+pub const CMD_ADD_WHITELIST: u32 = 0x0005;
+pub const CMD_RELAY_DATA: u32 = 0x0006;
 pub const CMD_LIST_SLOTS_META: u32 = 0x0007;
 
 // ---------------------------------------------------------------------------
@@ -34,15 +34,15 @@ pub const CMD_LIST_SLOTS_META: u32 = 0x0007;
 // Must match constants in `secret_proxy_ta/src/main.rs`.
 // ---------------------------------------------------------------------------
 
-pub const BIZ_SUCCESS:           u32 = 0x900D;
-pub const BIZ_RELAY_START:       u32 = 0x9001;
-pub const BIZ_RELAY_CONTINUE:    u32 = 0x9002;
-pub const BIZ_RELAY_DONE:        u32 = 0x9003;
-pub const BIZ_RELAY_STREAMING:   u32 = 0x9004;
-pub const BIZ_ERR_BAD_JSON:      u32 = 0xE001;
+pub const BIZ_SUCCESS: u32 = 0x900D;
+pub const BIZ_RELAY_START: u32 = 0x9001;
+pub const BIZ_RELAY_CONTINUE: u32 = 0x9002;
+pub const BIZ_RELAY_DONE: u32 = 0x9003;
+pub const BIZ_RELAY_STREAMING: u32 = 0x9004;
+pub const BIZ_ERR_BAD_JSON: u32 = 0xE001;
 pub const BIZ_ERR_KEY_NOT_FOUND: u32 = 0xE004;
-pub const BIZ_ERR_FORBIDDEN:     u32 = 0xE005;
-pub const BIZ_ERR_TRANSPORT:     u32 = 0xE006;
+pub const BIZ_ERR_FORBIDDEN: u32 = 0xE005;
+pub const BIZ_ERR_TRANSPORT: u32 = 0xE006;
 
 // ---------------------------------------------------------------------------
 // Admin API constants (serve mode HTTP headers + env vars)
@@ -78,10 +78,15 @@ mod tests {
         // would silently misroute in the relay state machine. Guard against
         // copy-paste bugs during future TA protocol edits.
         let codes = [
-            BIZ_SUCCESS, BIZ_RELAY_START, BIZ_RELAY_CONTINUE,
-            BIZ_RELAY_DONE, BIZ_RELAY_STREAMING,
-            BIZ_ERR_BAD_JSON, BIZ_ERR_KEY_NOT_FOUND,
-            BIZ_ERR_FORBIDDEN, BIZ_ERR_TRANSPORT,
+            BIZ_SUCCESS,
+            BIZ_RELAY_START,
+            BIZ_RELAY_CONTINUE,
+            BIZ_RELAY_DONE,
+            BIZ_RELAY_STREAMING,
+            BIZ_ERR_BAD_JSON,
+            BIZ_ERR_KEY_NOT_FOUND,
+            BIZ_ERR_FORBIDDEN,
+            BIZ_ERR_TRANSPORT,
         ];
         let mut seen = std::collections::HashSet::new();
         for c in codes {
@@ -94,8 +99,12 @@ mod tests {
         // Defensive: the TA indexes commands by id, so a gap would indicate
         // a removed command still referenced somewhere.
         let mut cmds = vec![
-            CMD_PROXY_REQUEST, CMD_PROVISION_KEY, CMD_REMOVE_KEY,
-            CMD_LIST_SLOTS, CMD_ADD_WHITELIST, CMD_RELAY_DATA,
+            CMD_PROXY_REQUEST,
+            CMD_PROVISION_KEY,
+            CMD_REMOVE_KEY,
+            CMD_LIST_SLOTS,
+            CMD_ADD_WHITELIST,
+            CMD_RELAY_DATA,
             CMD_LIST_SLOTS_META,
         ];
         cmds.sort();

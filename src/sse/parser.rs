@@ -269,9 +269,15 @@ mod tests {
         assert_eq!(
             parse_events(input),
             vec![
-                SseEvent::ContentBlockStart { block_type: "text".into() },
-                SseEvent::ContentBlockStart { block_type: "thinking".into() },
-                SseEvent::ContentBlockStart { block_type: "tool_use".into() },
+                SseEvent::ContentBlockStart {
+                    block_type: "text".into()
+                },
+                SseEvent::ContentBlockStart {
+                    block_type: "thinking".into()
+                },
+                SseEvent::ContentBlockStart {
+                    block_type: "tool_use".into()
+                },
             ]
         );
     }
@@ -281,7 +287,9 @@ mod tests {
         let input = b"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n";
         assert_eq!(
             parse_events(input),
-            vec![SseEvent::ContentBlockDelta(DeltaContent::Text("Hello".into()))]
+            vec![SseEvent::ContentBlockDelta(DeltaContent::Text(
+                "Hello".into()
+            ))]
         );
     }
 
@@ -290,7 +298,9 @@ mod tests {
         let input = b"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hmm\"}}\n";
         assert_eq!(
             parse_events(input),
-            vec![SseEvent::ContentBlockDelta(DeltaContent::Thinking("hmm".into()))]
+            vec![SseEvent::ContentBlockDelta(DeltaContent::Thinking(
+                "hmm".into()
+            ))]
         );
     }
 
@@ -299,7 +309,9 @@ mod tests {
         let input = b"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":\"}}\n";
         assert_eq!(
             parse_events(input),
-            vec![SseEvent::ContentBlockDelta(DeltaContent::Other("input_json_delta".into()))]
+            vec![SseEvent::ContentBlockDelta(DeltaContent::Other(
+                "input_json_delta".into()
+            ))]
         );
     }
 

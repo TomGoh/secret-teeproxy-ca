@@ -56,9 +56,7 @@ impl HttpResponse {
         // tightening is a wire-format change that would trip openclaw
         // and existing string matching. Revisit only with Phase 2's
         // HTTP framework migration.
-        let body = format!(
-            "{{\"error\":{{\"message\":\"{message}\",\"type\":\"proxy_error\"}}}}"
-        );
+        let body = format!("{{\"error\":{{\"message\":\"{message}\",\"type\":\"proxy_error\"}}}}");
         Self {
             status,
             status_text: status_text_for(status),
@@ -197,10 +195,7 @@ mod tests {
         let wire = render(&r);
         // The double-CRLF should appear exactly once, separating headers
         // from body.
-        let count = wire
-            .windows(4)
-            .filter(|w| *w == b"\r\n\r\n")
-            .count();
+        let count = wire.windows(4).filter(|w| *w == b"\r\n\r\n").count();
         assert_eq!(count, 1, "expected single header terminator");
     }
 }

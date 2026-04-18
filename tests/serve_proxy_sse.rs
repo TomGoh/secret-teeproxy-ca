@@ -333,7 +333,12 @@ fn pump_single_shot_then_advances() {
     // Round 2 (pump, empty input): CONTINUE with bytes → ToUpstream.
     queue_ta_round(&mut teec, BIZ_RELAY_CONTINUE, b"POST_PUMP_HS", b"");
     // Round 3 (upstream read): STREAMING starts.
-    queue_ta_round(&mut teec, BIZ_RELAY_STREAMING, b"HTTP/1.1 200 OK\r\n\r\n", b"");
+    queue_ta_round(
+        &mut teec,
+        BIZ_RELAY_STREAMING,
+        b"HTTP/1.1 200 OK\r\n\r\n",
+        b"",
+    );
     // Round 4: DONE.
     queue_ta_round(&mut teec, BIZ_RELAY_DONE, b"", b"");
 
@@ -366,7 +371,7 @@ fn pump_empty_does_not_cascade_into_second_pump() {
     let mut teec = MockTeec::new();
     queue_ta_round(&mut teec, BIZ_RELAY_CONTINUE, b"", b""); // round 1: empty → pump
     queue_ta_round(&mut teec, BIZ_RELAY_CONTINUE, b"", b""); // pump: also empty → fall through
-    // After fallthrough, next upstream read is EOF → double-EOF error.
+                                                             // After fallthrough, next upstream read is EOF → double-EOF error.
 
     let mut upstream = MockUpstream::new();
     upstream.queue_read_eof().queue_read_eof();

@@ -94,10 +94,19 @@ mod tests {
     #[test]
     fn display_teec_contains_cmd_id_and_rc() {
         // Display format is load-bearing: ops tooling greps for cmd_id + rc.
-        let e = Error::Teec { cmd_id: 0x0006, rc: 0xFFFF000E };
+        let e = Error::Teec {
+            cmd_id: 0x0006,
+            rc: 0xFFFF000E,
+        };
         let s = e.to_string();
-        assert!(s.contains("0x6"), "display should include cmd_id in hex: {s}");
-        assert!(s.contains("0xffff000e"), "display should include rc in hex: {s}");
+        assert!(
+            s.contains("0x6"),
+            "display should include cmd_id in hex: {s}"
+        );
+        assert!(
+            s.contains("0xffff000e"),
+            "display should include rc in hex: {s}"
+        );
     }
 
     #[test]
@@ -121,6 +130,9 @@ mod tests {
         let e = Error::AdminAuth("missing token");
         let s: String = e.into();
         assert!(s.contains("admin auth"), "bridge lost display prefix: {s}");
-        assert!(s.contains("missing token"), "bridge lost inner message: {s}");
+        assert!(
+            s.contains("missing token"),
+            "bridge lost inner message: {s}"
+        );
     }
 }

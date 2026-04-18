@@ -176,7 +176,10 @@ where
             decrypted: &response_buf[..filled],
             tls_extra: &tls_extra_buf[..tls_extra_filled],
         };
-        let RelayOutcome { events, next: next_action } = core::step(ta_out, &mut state);
+        let RelayOutcome {
+            events,
+            next: next_action,
+        } = core::step(ta_out, &mut state);
 
         // --- Apply the events the state machine emitted --------------
         for ev in events {
@@ -200,9 +203,7 @@ where
                         .map_err(|e| format!("client write body: {e}"))?;
                 }
                 RelayEvent::FlushClient => {
-                    client
-                        .flush()
-                        .map_err(|e| format!("client flush: {e}"))?;
+                    client.flush().map_err(|e| format!("client flush: {e}"))?;
                 }
                 RelayEvent::ClientFullResponse {
                     status,
@@ -411,7 +412,10 @@ mod tests {
         assert!(err.contains("TCP read timed out"), "got: {err}");
 
         let client_str = String::from_utf8_lossy(&client);
-        assert!(client_str.starts_with("HTTP/1.1 504 Error\r\n"), "got: {client_str}");
+        assert!(
+            client_str.starts_with("HTTP/1.1 504 Error\r\n"),
+            "got: {client_str}"
+        );
         assert!(client_str.contains("upstream timeout"));
     }
 

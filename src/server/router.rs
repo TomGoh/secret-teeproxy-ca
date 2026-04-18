@@ -99,7 +99,10 @@ mod tests {
 
     #[test]
     fn post_admin_remove() {
-        assert_eq!(route("POST", "/admin/keys/remove"), RouteAction::AdminRemove);
+        assert_eq!(
+            route("POST", "/admin/keys/remove"),
+            RouteAction::AdminRemove
+        );
     }
 
     #[test]
