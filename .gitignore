@@ -1,0 +1,14 @@
+# Rust build output
+/target/
+
+# Rust analyzer / IDE scratch
+**/*.rs.bk
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# Environment overrides (operators use these for admin-token etc.)
+.env
+.env.local
