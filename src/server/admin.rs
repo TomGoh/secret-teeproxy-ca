@@ -1,34 +1,30 @@
 //! Admin API authentication: validate `X-Admin-Token` against current
 //! and optional previous env-var values.
 //!
-//! This module is the replacement for `serve::check_admin_token`. The
-//! underlying logic is identical — same env var names, same lenient
-//! fallback on missing env, same constant-time compare, same prev-token
-//! rotation window — but reads env through a trait so tests can inject
-//! values without polluting the process environment.
+//! Env access goes through [`EnvSource`] so tests can inject values
+//! without polluting the process environment.
 //!
-//! # Rotation window semantics (preserve exactly)
+//! # Rotation window
 //!
 //! Operators rotating the admin token set the OLD value into
-//! `SECRET_PROXY_CA_ADMIN_TOKEN_PREV` before rolling the new value into
-//! `SECRET_PROXY_CA_ADMIN_TOKEN`. During the window, requests bearing
-//! either value succeed. Once rotation is complete, the operator clears
-//! `*_PREV` and the old token stops working.
+//! `SECRET_PROXY_CA_ADMIN_TOKEN_PREV` before rolling the new value
+//! into `SECRET_PROXY_CA_ADMIN_TOKEN`. During the window, requests
+//! bearing either value succeed. Once rotation completes, the operator
+//! clears `*_PREV` and the old token stops working.
 //!
-//! # Failure disambiguation
+//! # Failure disambiguation (caller depends on exact strings)
 //!
-//! Two distinct failure modes must be distinguishable because the
-//! handler maps them to different HTTP status codes:
+//! Two failure modes must remain distinguishable — the handler maps
+//! them to different HTTP status codes:
 //!
-//! | Failure | Error string prefix | HTTP status |
-//! |---|---|---|
-//! | Env var unset/empty | `"admin API disabled …"` | 503 Service Unavailable |
-//! | Token mismatch | `"invalid admin token"` | 401 Unauthorized |
+//! | Failure             | Error string prefix    | HTTP status           |
+//! |---------------------|------------------------|-----------------------|
+//! | Env var unset/empty | `"admin API disabled…"`| 503 Service Unavailable |
+//! | Token mismatch      | `"invalid admin token"`| 401 Unauthorized      |
 //!
-//! The caller inspects the returned error string prefix to decide. This
-//! coupling is ugly; future work (Phase 2 or later) can swap in a proper
-//! `enum AdminDecision`, but Step 4 preserves the exact string form so
-//! the pre-refactor dispatch in `serve.rs` keeps working.
+//! The caller greps the prefix. Future work (Phase 2) can swap in a
+//! proper `enum AdminDecision`; until then, preserve the exact strings
+//! or pytest will break.
 
 use crate::constants::{ADMIN_TOKEN_ENV, ADMIN_TOKEN_PREV_ENV};
 use crate::http::headers::{constant_time_equal, header_value};

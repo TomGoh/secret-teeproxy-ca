@@ -2,53 +2,49 @@
 //!
 //! # Why pure
 //!
-//! The pre-refactor `relay_and_stream` (in `serve.rs`) runs a 265-line
-//! `loop { tcp.read → teec.invoke → match biz_code → tcp.write / client.write }`.
-//! Bugs over the project's lifetime have clustered around the match
-//! arms — missed edge cases, wrong flag ordering, off-by-one in the
-//! chunked-decode integration. Extracting the dispatch as a pure
-//! function makes each biz_code transition individually testable with
-//! hand-crafted `RelayTaOutput` + `RelayState` pairs.
+//! The relay dispatch — "TA gave me a `BIZ_RELAY_*` response, what
+//! bytes do I write where?" — used to live inside a 265-line `loop { }`
+//! interleaved with TA invocations, upstream TCP I/O, and client HTTP
+//! writes. Bugs historically clustered in the match arms: missed edge
+//! cases, wrong flag ordering, off-by-one in chunked-decode integration.
+//! Extracting the dispatch as a pure function lets each biz_code
+//! transition be tested individually with hand-crafted
+//! [`RelayTaOutput`] + [`RelayState`] pairs.
 //!
 //! # What this module is NOT
 //!
-//! - Not a TA client. `teec.invoke` stays in the adapter (Step 7b).
-//! - Not a TCP server. Upstream reads/writes and client writes stay in
-//!   the adapter.
+//! - Not a TA client. `teec.invoke` lives in [`crate::relay::session`].
+//! - Not a TCP server. Upstream + client I/O live in `relay::session`.
 //! - Not responsible for the upstream-EOF double-detection
 //!   (`saw_eof → return Err("server closed before relay completed")`).
-//!   That is upstream-read loop state and lives in the adapter.
+//!   That is upstream-read loop state owned by `relay::session`.
 //!
-//! # Wire-behavior invariants that must survive refactor
-//!
-//! Any change to these will break openclaw or show up in pytest:
+//! # Wire-behavior invariants (DO NOT break these without a pytest run)
 //!
 //! 1. **Pump semantics**: BIZ_RELAY_CONTINUE with empty `decrypted`
-//!    triggers exactly one extra TA invoke with empty input. If that
+//!    triggers exactly ONE extra TA invoke with empty input. If that
 //!    second invoke is also empty, fall through to the next upstream
-//!    read — do **not** cascade pumps. This prevents a deadlock when
-//!    rustls has genuinely nothing to send.
+//!    read — do **not** cascade pumps. Cascading deadlocks when
+//!    rustls genuinely has nothing to send.
 //! 2. **Streaming preamble exactly once**: `StartStreamingResponse`
 //!    fires on the first `BIZ_RELAY_STREAMING`, not on subsequent ones.
 //! 3. **BIZ_RELAY_DONE short-response path**: if the TA completes the
 //!    whole request in one round (never emitted `BIZ_RELAY_STREAMING`)
 //!    the decrypted bytes are a `ProxyResponse` JSON and the caller
-//!    sends a plain HTTP response, not an SSE stream. Preserves
-//!    `Content-Type` passthrough from the upstream headers.
+//!    sends a plain HTTP response, not an SSE stream. `Content-Type`
+//!    passes through from the upstream headers verbatim.
 //! 4. **Unknown biz_code error string** is exactly
-//!    `"relay error: 0x{biz:04x}"` — pytest greps on it.
+//!    `"relay error: 0x{biz:04x}"` — pytest greps on it; do not reword.
 //! 5. **Chunked decoder state** is carried across `step()` calls via
 //!    `RelayState`; partial chunks that span TA roundtrips must be
-//!    buffered in the decoder, not the caller (this is what broke in
-//!    the pre-Step-2 `strip_chunked_framing` design — fixing it was
-//!    the whole point of Step 2).
+//!    buffered in the decoder, not in the caller.
 //!
 //! # Testing
 //!
-//! See the `tests` module at the bottom of this file. Every biz_code
-//! branch + each pump phase + each error path has at least one test;
-//! plus a handful of "realistic trace" tests that drive a sequence of
-//! step() calls simulating a full relay round.
+//! See the `tests` module at the bottom. Every biz_code branch + each
+//! pump phase + each error path has at least one test, plus a handful
+//! of "realistic trace" tests that drive a CONTINUE→PUMP→STREAMING→DONE
+//! sequence representing a full relay round.
 
 use crate::constants::{
     BIZ_RELAY_CONTINUE, BIZ_RELAY_DONE, BIZ_RELAY_STREAMING, BIZ_RELAY_START,
@@ -105,9 +101,8 @@ pub enum RelayEvent {
     /// and handed back a `ProxyResponse` JSON. Adapter writes a single
     /// non-streaming HTTP response with the given status + headers + body.
     ///
-    /// `content_type` is taken from the `ProxyResponse.headers["content-type"]`
-    /// if present, else defaults to `"application/json"` (matches
-    /// pre-refactor behavior at serve.rs:956-961).
+    /// `content_type` is taken from `ProxyResponse.headers["content-type"]`
+    /// if present, else defaults to `"application/json"`.
     ClientFullResponse {
         status: u16,
         content_type: String,
@@ -148,8 +143,8 @@ pub struct RelayOutcome {
 /// the next streaming chunk"); hiding the fields would force each test
 /// through a dance of synthetic early `step()` calls.
 ///
-/// Adapters (Step 7b) should treat the fields as opaque and construct
-/// a fresh state with `new()` per session.
+/// Adapters should treat the fields as opaque and construct a fresh
+/// state with `new()` per session.
 pub struct RelayState {
     pub response_started: bool,
     pub upstream_is_chunked: bool,
@@ -339,12 +334,11 @@ fn step_done(ta: RelayTaOutput<'_>, state: &mut RelayState) -> RelayOutcome {
     }
 }
 
-/// Pure: parse `HTTP/1.1 {status} {text}\r\n...\r\n\r\n{body}` from the
+/// Parse `HTTP/1.1 {status} {text}\r\n...\r\n\r\n{body}` from the
 /// first streaming chunk. Returns `(status_code, byte_offset_of_body)`.
-///
-/// Preserved byte-for-byte from the pre-refactor
-/// `serve::parse_upstream_headers` (Step 7a moves it here; serve.rs
-/// keeps the original until Step 7b rewires the loop).
+/// Falls back to 200 when the status line is malformed, and to
+/// `data.len()` (empty body slice) when there's no `\r\n\r\n` yet —
+/// both behaviors are pytest-pinned in `format/test_proxy_format.py`.
 fn parse_upstream_headers(data: &[u8]) -> (u16, usize) {
     let boundary = data
         .windows(4)
@@ -561,7 +555,7 @@ mod tests {
     #[test]
     fn streaming_subsequent_with_chunked_decoder_decodes_across_calls() {
         // A chunk size line split across two TA rounds — exactly the
-        // scenario the Step 2 ChunkedDecoder was designed for.
+        // scenario the stateful `ChunkedDecoder` is designed for.
         let mut state = RelayState::new();
         state.response_started = true;
         state.upstream_is_chunked = true;
@@ -813,8 +807,9 @@ mod tests {
 
     #[test]
     fn parse_upstream_headers_no_boundary_returns_end() {
-        // Full buffer is headers with no \r\n\r\n yet. Pre-refactor
-        // fallback: body_start = data.len() (i.e. empty body slice).
+        // No \r\n\r\n boundary yet → body_start = data.len()
+        // (i.e. the caller gets an empty body slice and waits for
+        // the next chunk to carry the rest of the headers).
         let data = b"HTTP/1.1 200 OK\r\n";
         let (_, off) = parse_upstream_headers(data);
         assert_eq!(off, data.len());

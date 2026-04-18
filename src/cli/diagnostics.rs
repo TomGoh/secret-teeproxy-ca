@@ -12,9 +12,6 @@
 //!   then close. Output is the raw errno (with a human hint) so the
 //!   operator can tell apart SELinux denials from missing peers from
 //!   "kernel has no vsock at all" during bring-up.
-//!
-//! Step 10 refactor: moved here from `main.rs` (SockaddrVm struct,
-//! vsock_test/errno_hint helpers, inline dns-test block).
 
 use std::net::ToSocketAddrs;
 

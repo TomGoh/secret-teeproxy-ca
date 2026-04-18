@@ -1,13 +1,10 @@
 //! CLI argv dispatch + subcommand handlers.
 //!
-//! `main()` (in `src/main.rs`) calls [`run`] with `std::env::args()`;
-//! this module does everything else: parse the subcommand, open
-//! `RealTeec` when needed, dispatch to a subcommand fn, print usage.
-//!
-//! Step 10 refactor: this was inlined in `main.rs::run()`. Moved
-//! here so the binary entry is a few lines of env_logger init + one
-//! `cli::run()` call, and all subcommand logic lives next to its
-//! usage text.
+//! `main()` calls [`run`]; this module parses the subcommand, opens a
+//! `RealTeec` session when the subcommand needs TA access, dispatches,
+//! and prints usage. The `serve` subcommand delegates to
+//! [`crate::server::run`]; TEEC-free diagnostics (`dns-test`,
+//! `vsock-test`) live in [`diagnostics`] and skip the TEE session open.
 
 pub mod diagnostics;
 
@@ -25,8 +22,8 @@ use crate::wire::ProvisionKeyPayload;
 /// defers `serve` to [`crate::server::run`].
 ///
 /// Returns `Err` only for subcommand failures; an unknown subcommand
-/// prints usage and returns `Ok(())` (matches pre-refactor behavior,
-/// so `secret_proxy_ca --help` exits 0).
+/// prints usage and returns `Ok(())` so
+/// `secret_proxy_ca --help` (and typos) exit 0.
 pub fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -137,10 +134,8 @@ fn print_usage(prog: &str) {
     eprintln!("  {prog} dns-test <hostname>");
     eprintln!("  {prog} vsock-test <cid> [port]");
     eprintln!();
-    eprintln!("HTTP proxy requests are served only via `serve` mode (the `proxy`");
-    eprintln!("CLI subcommand was removed in the Step 8 refactor — it had no");
-    eprintln!("external callers). Clients should POST SecretProxyRequest JSON");
-    eprintln!("to the port configured with --port.");
+    eprintln!("HTTP proxy requests are served only via `serve` mode.");
+    eprintln!("Clients POST SecretProxyRequest JSON to the port set by --port.");
     eprintln!();
     eprintln!("dns-test is a TEEC-free diagnostic: resolves <hostname>:443 via the");
     eprintln!("platform's getaddrinfo and prints the result. Use it on Android to");

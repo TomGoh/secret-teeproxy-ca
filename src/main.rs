@@ -12,7 +12,7 @@
 //! TLS state machine (rustls) inside the TEE, while this CA handles
 //! TCP I/O to external API servers. No separate tls_forwarder needed.
 //!
-//! # Where the code lives (Step 10 layout)
+//! # Module layout
 //!
 //! ```text
 //! main.rs          this file (env_logger init + cli::run)
@@ -25,7 +25,7 @@
 //! wire.rs          CA↔TA JSON DTOs
 //! constants.rs     TA_UUID + CMD_* + BIZ_* + env var names
 //! error.rs         thiserror Error enum + From<Error> for String
-//! clock.rs         Clock trait (unused in Phase 1, ready for Phase 2)
+//! clock.rs         Clock trait (unused by production, ready for timeouts)
 //! ```
 //!
 //! `main()` below is deliberately tiny — all logic is in submodules.
@@ -41,11 +41,10 @@ mod sse;
 mod teec;
 mod wire;
 
-// Re-export crate-root names used by other modules. Consumers that
-// want to import these should prefer the explicit paths (e.g.
-// `crate::wire::ProxyResponse`) in new code; the re-exports stay
-// so the Step 1-9 churn doesn't compound into "every module updated
-// twice" in Step 10.
+// Re-export crate-root names used by other modules. Prefer explicit
+// paths (e.g. `crate::wire::ProxyResponse`) in new code; these
+// re-exports are kept to avoid a mechanical renames pass across every
+// module — they can be tightened incrementally.
 #[allow(unused_imports)]
 pub(crate) use constants::{
     ADMIN_ACTOR_HEADER, ADMIN_REQUEST_ID_HEADER, ADMIN_TOKEN_ENV, ADMIN_TOKEN_MIN_LEN,

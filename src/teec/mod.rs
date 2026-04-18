@@ -2,34 +2,34 @@
 //!
 //! # Why a trait?
 //!
-//! Every call into the TA goes through `TEEC_InvokeCommand(session, cmd_id,
-//! &mut op, &mut origin)`. Before Step 5 these calls were scattered directly
-//! across `main.rs` and `serve.rs`, making it impossible to unit-test the
-//! parameter marshalling: a wrong `params[i]` slot or bad `paramTypes` would
-//! only surface on a real TEE device as a silent TA failure.
+//! Every call into the TA goes through
+//! `TEEC_InvokeCommand(session, cmd_id, &mut op, &mut origin)`. The
+//! trait gives each call-site an injectable seam so the marshalling
+//! (wrong `params[i]` slot, wrong `paramTypes` bits, off-by-one in
+//! output buffer size) can be unit-tested without a real TEE device.
+//! A wrong layout on the real TA silently fails — the mock lets us
+//! catch it bit-exactly.
 //!
-//! The trait gives each call-site a seam:
+//! Implementations:
+//! - [`RealTeec`] — holds a live `TEEC_Context + TEEC_Session`; `Drop`
+//!   closes both handles in the close-session-before-finalize-context
+//!   order the GP TEE spec requires.
+//! - [`mock::MockTeec`] (test-only, gated on
+//!   `#[cfg(any(test, feature="test-support"))]`) — records every
+//!   invocation and runs a scripted mutator on the `TEEC_Operation`
+//!   so tests can simulate the TA's responses.
 //!
-//! - [`RealTeec`] holds a live `TEEC_Context + TEEC_Session` pair. `invoke()`
-//!   forwards to `TEEC_InvokeCommand`; `Drop` closes both handles in the
-//!   same order as the pre-refactor cleanup (session first, then context).
-//! - [`mock::MockTeec`] (test-only, gated on `#[cfg(any(test,
-//!   feature="test-support"))]`) records every invocation and runs a
-//!   scripted mutator on the `TEEC_Operation` so tests can simulate the
-//!   TA's responses.
+//! # What the trait does NOT do
 //!
-//! # What the trait does **not** do
+//! It is intentionally a thin wrapper over the C function. Callers
+//! still build `TEEC_Operation` structs themselves (set `paramTypes`,
+//! fill `params[i].tmpref` / `params[i].value`). Wrapping the
+//! `TEEC_Parameter` union would force every call site through a typed
+//! API with no real safety win — the C layout is already `#[repr(C)]`
+//! and the marshalling is exactly what we want visible for review.
 //!
-//! It is intentionally a thin wrapper over the C function. Callers still
-//! build `TEEC_Operation` structs themselves (set `paramTypes`, fill
-//! `params[i].tmpref` / `params[i].value`). That is on purpose — wrapping
-//! the `TEEC_Parameter` union would force every call site through a new
-//! typed API with no real safety win (the C layout is already `#[repr(C)]`
-//! and the marshalling is exactly what we want to keep visible for review).
-//!
-//! Instead, tests verify the marshalling by inspecting `InvokeCall`
-//! records produced by `MockTeec`. See `teec::mock::tests` and the
-//! param-layout tests in `main.rs` for examples.
+//! Tests verify marshalling by inspecting `InvokeCall` records from
+//! `MockTeec`. See [`ops::tests`](crate::teec::ops) for examples.
 
 pub mod ops;
 pub mod real;

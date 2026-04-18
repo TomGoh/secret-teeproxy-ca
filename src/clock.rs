@@ -1,21 +1,15 @@
 //! Time abstraction for testability.
 //!
-//! Currently unused by production code — added in Step 10 as the
-//! forward-looking hook for Phase 2 features that need to reason
-//! about time (e.g. idle-timeout enforcement on HTTP connections,
-//! watchdog heartbeats, admin token rotation expiry).
+//! Currently unused by production code. Landed as a forward-looking
+//! hook for features that need to reason about time — idle-timeout
+//! enforcement on HTTP connections, watchdog heartbeats, admin token
+//! rotation expiry. Production code that wants to sleep or compare
+//! timestamps should reach for the trait so unit tests can advance
+//! `MockClock::advance(Duration)` deterministically instead of
+//! sprinkling real `thread::sleep` calls.
 //!
-//! When production code wants to sleep or compare timestamps, using
-//! the trait lets unit tests advance `MockClock::advance(Duration)`
-//! deterministically instead of sprinkling `thread::sleep` calls.
-//!
-//! # Why pre-land an unused trait?
-//!
-//! Because every refactor step in Phase 2 that needs time will add
-//! one or two sleep calls and one or two timestamp reads; without
-//! this trait, each one becomes its own mini-PR debate about
-//! "should we use SystemClock or mock?" Landing the trait now makes
-//! the answer obvious from day one.
+//! Pre-landed (rather than added lazily per feature) to avoid a
+//! per-feature "should we use SystemClock or mock?" debate.
 
 use std::time::{Duration, Instant};
 

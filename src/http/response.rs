@@ -6,14 +6,22 @@
 //! - Error shapes: `{"error":{"message":"...","type":"proxy_error"}}`
 //!   in JSON with a given status.
 //!
-//! **Not covered**: SSE streaming responses to `POST /` proxy requests —
-//! those are handled inline in `serve.rs::relay_and_stream` and moved
-//! into `crate::sse` in Step 6. SSE needs chunked Transfer-Encoding and
-//! cannot pre-compute `Content-Length`, so it doesn't fit this builder.
+//! **Not covered**: SSE streaming responses to `POST /` proxy requests
+//! — those live in `crate::sse::encoder` + `crate::relay::session`.
+//! SSE can't pre-compute `Content-Length`, so it doesn't fit this
+//! buffered builder.
 //!
 //! **Not a full HTTP framework**. Always emits `Connection: close`,
-//! never keep-alive. This matches pre-refactor behavior and sidesteps
-//! HTTP/1.1 pipelining hazards that the serve loop is not designed for.
+//! never keep-alive — the serve loop is not designed for HTTP/1.1
+//! pipelining.
+//!
+//! # NOTE: this module is not yet wired in
+//!
+//! The serve-mode handlers in `server::connection` still use inline
+//! `format!(...)` + `client.write_all` calls; `HttpResponse::write_to`
+//! is reserved for a future migration. It's kept here so a
+//! sibling-but-untested API doesn't appear out of thin air the day we
+//! need it.
 
 use std::io::{self, Write};
 
@@ -38,15 +46,16 @@ impl HttpResponse {
         }
     }
 
-    /// JSON response with an arbitrary non-2xx status and `{"error":…}`
-    /// shape. Matches the pre-refactor `send_error` output byte-for-byte
-    /// (with the same `proxy_error` type discriminator).
+    /// JSON response with an arbitrary non-2xx status and
+    /// `{"error":{"message":"...","type":"proxy_error"}}` body shape.
+    /// openclaw + pytest `format/test_proxy_format.py` both grep on
+    /// this exact shape; do not reword.
     pub fn proxy_error(status: u16, message: &str) -> Self {
-        // The pre-refactor format uses naive double-quote formatting, so a
-        // message containing `"` would produce invalid JSON. We preserve
-        // that behavior here — fixing it would be a silent wire-format
-        // change that could trip downstream string matching. Upstream
-        // tightening is Phase 2 (HTTP framework migration) territory.
+        // Naive double-quote formatting: a `message` containing `"`
+        // would produce invalid JSON. Preserved deliberately — any
+        // tightening is a wire-format change that would trip openclaw
+        // and existing string matching. Revisit only with Phase 2's
+        // HTTP framework migration.
         let body = format!(
             "{{\"error\":{{\"message\":\"{message}\",\"type\":\"proxy_error\"}}}}"
         );
@@ -97,9 +106,9 @@ impl HttpResponse {
     }
 }
 
-/// Map common HTTP status codes to their reason-phrase. Not exhaustive;
+/// Map common HTTP status codes to their reason-phrase. Not exhaustive —
 /// only covers codes the CA emits in practice. Unknown codes fall back
-/// to `"Error"` (same as pre-refactor `send_error`).
+/// to `"Error"`, which matches `send_error`'s generic phrasing.
 fn status_text_for(status: u16) -> &'static str {
     match status {
         200 => "OK",
@@ -159,8 +168,8 @@ mod tests {
 
     #[test]
     fn connection_close_is_always_set() {
-        // Pre-refactor always sent Connection: close. Phase 2 may change
-        // this for keep-alive, but Step 3 preserves current behavior.
+        // The serve loop is single-request; keep-alive is unsupported.
+        // Phase 2's HTTP framework migration can revisit.
         for r in [
             HttpResponse::json_ok(""),
             HttpResponse::proxy_error(502, "boom"),

@@ -11,8 +11,8 @@
 //! assert the marshalling after the fact — especially the `paramTypes`
 //! bit-pattern, which is the classic foot-gun.
 //!
-//! Only compiled under `#[cfg(test)]` or with the (to-be-added in Step 10)
-//! `test-support` feature, so production binaries never link it.
+//! Only compiled under `#[cfg(test)]` or with the `test-support`
+//! feature, so production binaries never link it.
 
 use std::collections::VecDeque;
 

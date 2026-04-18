@@ -33,7 +33,8 @@ pub struct HttpRequest {
     /// interop with the existing `header_value()` helper.
     pub headers_text: String,
     /// `Content-Length` as parsed from headers. `0` if header is absent
-    /// or unparseable — consistent with pre-refactor behavior.
+    /// or unparseable (lenient — duplicate or malformed headers don't
+    /// error out).
     pub content_length: usize,
     /// Body bytes exactly `content_length` long. Empty for requests
     /// without a body.
@@ -48,11 +49,11 @@ pub struct HttpRequest {
 /// - Connection closed mid-request (I/O error surfaces verbatim)
 /// - Body read short of `Content-Length` (socket closed early)
 ///
-/// Does **not** check for oversize headers, oversize body, or slow clients.
-/// Those hardening checks belong in Phase 2 (`docs/phase2-improvements.md`
-/// §2 HTTP Connection Management); Step 3 preserves the pre-refactor
-/// lenient behavior byte-for-byte so pytest Characterization Tests stay
-/// green.
+/// Does **not** check for oversize headers, oversize body, or slow
+/// clients. Those hardening checks belong in Phase 2 (see
+/// `docs/phase2-improvements.md` §2 HTTP Connection Management). The
+/// lenient behavior is byte-for-byte pytest-pinned — do not tighten
+/// without updating the format test suite.
 pub fn parse_request<R: BufRead>(reader: &mut R) -> Result<HttpRequest, String> {
     // --- Request line ----------------------------------------------------
     let mut request_line = String::new();
@@ -79,10 +80,9 @@ pub fn parse_request<R: BufRead>(reader: &mut R) -> Result<HttpRequest, String> 
     }
 
     // --- Content-Length (case-insensitive scan of the raw block) --------
-    // We intentionally use the same all-lowercase heuristic as pre-refactor
-    // code for byte-identical behavior. Duplicate `Content-Length` headers
-    // or malformed values silently default to `0`, which is how the original
-    // parser behaved.
+    // Duplicate `Content-Length` headers or malformed values silently
+    // default to `0`. Pytest format suite depends on this exact
+    // lenient behavior.
     let content_length = headers_text
         .lines()
         .find_map(|line| {
@@ -138,8 +138,8 @@ mod tests {
 
     #[test]
     fn method_is_uppercased() {
-        // Lowercase on the wire → uppercase on the struct (matches
-        // pre-refactor which called to_ascii_uppercase unconditionally).
+        // Lowercase on the wire → uppercase on the struct. Downstream
+        // router matches on "GET"/"POST"/etc. literals.
         let req = parse(b"get /health HTTP/1.1\r\n\r\n").unwrap();
         assert_eq!(req.method, "GET");
     }
@@ -166,8 +166,8 @@ mod tests {
 
     #[test]
     fn missing_content_length_defaults_to_zero() {
-        // Pre-refactor behavior: no Content-Length → parse as 0, read
-        // zero body bytes. Don't error (lenient).
+        // No Content-Length → parse as 0, read zero body bytes.
+        // Lenient by design (see fn-level docs).
         let req = parse(b"POST / HTTP/1.1\r\n\r\n").unwrap();
         assert_eq!(req.content_length, 0);
         assert!(req.body.is_empty());
@@ -185,8 +185,8 @@ mod tests {
 
     #[test]
     fn malformed_content_length_silently_falls_to_zero() {
-        // Pre-refactor: `parse::<usize>().ok()` swallows parse errors.
-        // Preserve that. (Phase 2 hardening can tighten.)
+        // `parse::<usize>().ok()` swallows errors by design. Phase 2
+        // hardening can tighten; until then this is deliberate.
         let req = parse(
             b"POST / HTTP/1.1\r\nContent-Length: not-a-number\r\n\r\n",
         )
@@ -224,8 +224,8 @@ mod tests {
 
     #[test]
     fn empty_path_defaults_to_slash() {
-        // Pre-refactor: parts.next().unwrap_or("/") — an empty request
-        // line should still yield "/" not panic.
+        // `parts.next().unwrap_or("/")` — an empty/partial request line
+        // must still yield `/` and not panic.
         let req = parse(b"POST\r\n\r\n").unwrap();
         assert_eq!(req.path, "/");
     }

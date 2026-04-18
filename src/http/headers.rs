@@ -1,9 +1,8 @@
 //! Pure helpers for working with HTTP headers and tokens.
 //!
-//! These functions do zero I/O and hold no state, so they are the easiest
-//! slice of the CA to unit-test. All four were previously free functions
-//! at the top of `serve.rs`; they moved here verbatim (byte-identical
-//! behavior) during the Step 2 refactor.
+//! Zero I/O, no state — the easiest slice of the CA to unit-test.
+//! Includes the constant-time compare used for admin-token validation
+//! (see [`constant_time_equal`]).
 
 use crate::constants::ADMIN_TOKEN_MIN_LEN;
 

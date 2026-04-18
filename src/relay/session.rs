@@ -5,23 +5,26 @@
 //!
 //! # What this module owns
 //!
-//! Everything the Step 7a state machine deliberately doesn't:
+//! Everything the pure state machine deliberately doesn't:
 //!
-//! - Upstream TCP read (via [`Upstream`]) + upstream-EOF double-detect.
+//! - Upstream TCP read (via [`Upstream`]) + upstream-EOF double-detect
+//!   (`saw_eof` twice in a row ⇒ `"server closed before relay completed"`).
 //! - TA invoke (via [`Teec`]) — builds the `TEEC_Operation` for
 //!   `CMD_RELAY_DATA`, unpacks the result into `RelayTaOutput`.
 //! - HTTP client writes — preamble + body streaming + flush + the
 //!   short-response full HTTP response.
 //! - Error → HTTP status mapping: TCP TimedOut → 504, TCP read failure
 //!   → 502, TA invoke rc failure → 502, state-machine Error → 502.
+//!   After the SSE preamble has been written, mid-stream errors
+//!   **must not** call `send_error` (would corrupt the response).
 //!
 //! # Why a free function not a struct
 //!
-//! The pre-refactor relay loop was a single `fn`, so integration tests
-//! can drive it as "call once, assert afterwards." A struct with
-//! `.step() / .step()` would make tests harder to read without buying
-//! anything — the per-iteration state is tiny (two booleans) and lives
-//! naturally inside the function body.
+//! Per-session state is tiny (`RelayState` is two booleans + a decoder
+//! + a pump flag) and integration tests read more naturally as
+//! "call once, assert afterwards" than as `.step()`/`.step()`. A
+//! struct with methods would buy nothing over a free fn taking
+//! `&mut RelayState`.
 
 use std::io::{self, Write};
 
@@ -37,9 +40,8 @@ use crate::teec::Teec;
 
 /// Run the full TEEC ↔ upstream ↔ client relay loop.
 ///
-/// Preserves the pre-refactor `serve::relay_and_stream` wire behavior
-/// byte-for-byte — pytest smoke/format and the recovery suite on
-/// device 10.218.64.6 are the acceptance gate.
+/// Wire behavior is pytest-pinned — the smoke/format/recovery suite
+/// in `tests/` is the acceptance gate for any change here.
 ///
 /// Returns `Ok(())` on clean BIZ_RELAY_DONE. Any other exit — upstream
 /// EOF before DONE, TCP error, TA error, state-machine error, client
@@ -124,7 +126,7 @@ where
 
         // --- Invoke TA CMD_RELAY_DATA --------------------------------
         //
-        // Param layout (unchanged from pre-refactor):
+        // Param layout (wire contract, do not reorder):
         //   params[0] MEMREF_TEMP_INPUT   ciphertext from upstream
         //   params[1] VALUE_INOUT         {in: a=eof_flag, out: a=biz, b=detail}
         //   params[2] MEMREF_TEMP_OUTPUT  decrypted response
@@ -427,27 +429,18 @@ mod tests {
 
     #[test]
     fn double_eof_yields_server_closed_error() {
+        // Script:
+        //   Round 1: upstream EOF → TA returns CONTINUE+empty → PumpTa.
+        //   Pump round (no upstream read) → TA again CONTINUE+empty →
+        //   adapter falls through (no cascade) → ReadUpstream.
+        //   Round 2: upstream EOF again → adapter's saw_eof flag is set
+        //   from round 1 → `"server closed before relay completed"`.
         let mut teec = MockTeec::new();
-        // Round 1: TA says CONTINUE with empty decrypt on EOF input.
-        queue_ta_round(&mut teec, BIZ_RELAY_CONTINUE, b"", b"");
-        // Round 2: after second EOF, we should surface the error
-        // before invoking TA a second time.
+        queue_ta_round(&mut teec, BIZ_RELAY_CONTINUE, b"", b""); // round 1 result
+        queue_ta_round(&mut teec, BIZ_RELAY_CONTINUE, b"", b""); // pump result
 
         let mut upstream = MockUpstream::new();
-        // After first EOF (round 1), TA returns CONTINUE+empty → PumpTa.
-        // Pump doesn't read upstream. Next loop iteration reads EOF
-        // again → second EOF → error.
-        //
-        // Wait — the pump won't ReadUpstream. Let me re-script:
-        // Round 1: ReadUpstream EOF → TA returns STREAMING? No,
-        // simpler to script plain CONTINUE-with-bytes round 1 to
-        // avoid pump path.
-        upstream
-            .queue_read_eof()
-            .queue_read_eof();
-        // After the pump clears state, next ReadUpstream hits second
-        // EOF → "server closed before relay completed".
-        queue_ta_round(&mut teec, BIZ_RELAY_CONTINUE, b"", b"");
+        upstream.queue_read_eof().queue_read_eof();
 
         let mut client = Vec::<u8>::new();
         let err = run_relay_loop(&mut teec, &mut upstream, &mut client, b"HELLO")

@@ -1,15 +1,11 @@
 //! Wire-format DTOs shared across the CA↔TA boundary.
 //!
 //! Every type here is `Serialize`+`Deserialize` and crosses the TEEC
-//! MEMREF boundary as JSON. **Field names are part of the protocol**:
+//! MEMREF boundary as JSON. **Field names are part of the protocol** —
 //! renaming `key_id` or `endpoint_url` silently breaks the TA without
 //! any Rust-level error. The pairing TA definitions live in
-//! `secret_proxy_ta::protocol` (see `secret-proxy-ta/`); update both
-//! sides together or don't update either.
-//!
-//! Step 10 refactor: moved here from `main.rs` so the binary entry
-//! shrinks to just CLI dispatch, and so future changes to wire
-//! contracts have a single place to audit.
+//! `secret_proxy_ta::protocol`; update both sides together or don't
+//! update either.
 
 use std::collections::HashMap;
 

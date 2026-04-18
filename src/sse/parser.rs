@@ -11,7 +11,7 @@
 //! forwards the raw byte stream verbatim to openclaw; it just also
 //! parses the bytes in-process so `RUST_LOG=info` shows the LLM's
 //! actual words in the daemon log. Any parse failure is silently
-//! skipped (same behavior as the pre-refactor `log_sse_content`).
+//! skipped — observability is never allowed to break a request.
 //!
 //! # Why "data:" only
 //!
@@ -27,15 +27,13 @@
 //! ```
 //!
 //! The `type` field inside the JSON mirrors the `event:` line, so
-//! parsing only the `data:` lines and reading `event["type"]` is
-//! equivalent. This matches the pre-refactor `log_sse_content`, which
-//! ignored the `event:` line entirely.
+//! parsing only `data:` lines and reading `event["type"]` is
+//! equivalent — the `event:` line is ignored.
 //!
 //! # `[DONE]` sentinel
 //!
-//! Anthropic (unlike OpenAI) does not actually send `data: [DONE]`, but
-//! `log_sse_content` preserved the branch "just in case" and we match
-//! that. See [`SseEvent::Done`].
+//! Anthropic doesn't emit `data: [DONE]`, but OpenAI-compatible
+//! upstreams routed through this proxy do. See [`SseEvent::Done`].
 
 use log::info;
 
@@ -78,12 +76,10 @@ pub enum DeltaContent {
 
 /// Parse all `data:` lines in `data` and return one [`SseEvent`] per
 /// successfully-decoded event. Malformed lines and non-data lines are
-/// silently skipped (matches pre-refactor behavior).
+/// silently skipped.
 ///
-/// The input is treated as UTF-8; any bytes that are not valid UTF-8
-/// cause the entire buffer to be skipped (returning an empty Vec).
-/// This matches `log_sse_content`'s `let Ok(text) = from_utf8(data)
-/// else { return };`.
+/// Input is treated as UTF-8; invalid UTF-8 makes the whole buffer
+/// yield an empty `Vec` — observability never breaks a request.
 pub fn parse_events(data: &[u8]) -> Vec<SseEvent> {
     let Ok(text) = std::str::from_utf8(data) else {
         return Vec::new();
@@ -98,8 +94,6 @@ pub fn parse_events(data: &[u8]) -> Vec<SseEvent> {
 }
 
 fn parse_one_line(line: &str) -> Option<SseEvent> {
-    // `let Ok(...) = ... else { continue }` pre-refactor; here translated
-    // to `?` over Option returns since we're in a helper.
     let payload = line.strip_prefix("data: ")?;
     if payload == "[DONE]" {
         return Some(SseEvent::Done);
@@ -167,12 +161,9 @@ fn parse_one_line(line: &str) -> Option<SseEvent> {
     }
 }
 
-/// Log one parsed event at the appropriate level. Consolidates the
-/// logging side-effect the pre-refactor `serve::log_sse_content`
-/// performed inline, now driven by the pure parser above.
-///
-/// Keeps the exact message shapes the operator is used to seeing so
-/// `grep '◄ message_stop'` in daemon.log still works.
+/// Log one parsed event at the appropriate level. Message shapes
+/// (`◄ message_stop`, `◄ [thinking]`, etc.) are what operators grep
+/// for in `daemon.log`; preserve them when editing.
 pub fn log_event(ev: &SseEvent) {
     match ev {
         SseEvent::MessageStart { model, id } => {
@@ -383,12 +374,10 @@ mod tests {
         assert_eq!(parse_events(input), vec![]);
     }
 
-    // ----- Property test (hand-rolled, no proptest crate yet) -----
-    // Round-trip: build N events, format them as SSE bytes, parse, assert
-    // same. Keeps us honest that the parser and (conceptual) encoder
-    // agree on shape. No external proptest dep — the plan called for
-    // proptest but adding the crate this step would be feature creep;
-    // deferring the dep to Step 7a where the state machine benefits more.
+    // ----- Lightweight round-trip test (no proptest crate) ------
+    // Feed N hand-crafted SSE events through the parser and assert
+    // the output matches. Not a property test proper, but exercises
+    // the shape contract between "what we write" and "what we parse".
     #[test]
     fn round_trip_stop_and_done_and_ping() {
         let body = "data: {\"type\":\"message_stop\"}\n\

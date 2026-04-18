@@ -8,16 +8,14 @@
 //! 4. Unpacks outputs (biz_code, MEMREF_TEMP_OUTPUT slices).
 //! 5. Returns a Rust-typed `Result`.
 //!
-//! The `paramTypes` layouts are unit-tested below — swap an input for
-//! an output accidentally and the test fires without needing a TA.
-//! These were the "silent TA failure" landmines Step 5 was designed
-//! to defuse; see commit `ddf979d` for context.
+//! # Why every layout is unit-tested
 //!
-//! Step 10 refactor: functions moved here from `main.rs`
-//! (`teec_list_slots`, `teec_list_slots_meta`, `teec_provision_key`,
-//! `teec_remove_key`, `teec_add_whitelist`, `check_teec_rc`,
-//! `check_biz_code`, `ta_error_layer`). Layout tests moved from
-//! `main.rs::teec_layout_tests` into the `tests` submodule here.
+//! The TA silently fails (returns `0xFFFF0000` or garbage output) when
+//! `paramTypes` doesn't match its expectation exactly — wrong order of
+//! `MEMREF_*` vs `VALUE_*`, INPUT↔OUTPUT flipped, etc. These are the
+//! hardest bugs to diagnose from the CA side. The `tests` submodule
+//! pins each command's layout as a bit-exact constant so any future
+//! reorder trips a local unit test, not a silent device regression.
 
 use std::mem;
 
@@ -132,9 +130,8 @@ pub(crate) fn teec_remove_key(teec: &mut dyn Teec, slot: u32) -> Result<(), Stri
 }
 
 /// Add a URL prefix pattern to the TA's whitelist via
-/// `CMD_ADD_WHITELIST` (0x0005). Extracted from the old
-/// `cmd_add_whitelist` CLI handler so `cli::subcommands` only has the
-/// argument-parsing half and this module owns the wire protocol.
+/// `CMD_ADD_WHITELIST` (0x0005). The TA matches
+/// `endpoint_url.starts_with(pattern)` — prefix match, not glob.
 pub(crate) fn teec_add_whitelist(
     teec: &mut dyn Teec,
     pattern: &str,
@@ -214,10 +211,10 @@ pub(crate) fn ta_error_layer(message: &str) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// Step 5 param-layout validation tests (moved from main.rs in Step 10).
+// Param-layout validation tests.
 //
-// Each test drives a helper with `MockTeec` and asserts the cmd_id +
-// paramTypes combination matches what the TA expects. The TA silently
+// Each test drives one helper with `MockTeec` and asserts the cmd_id +
+// `paramTypes` bit pattern matches what the TA expects. The TA silently
 // fails on wrong paramTypes, so locking the layout at unit-test time
 // catches any future reorder (dropping a VALUE_OUTPUT, flipping
 // INPUT↔OUTPUT, etc.) without needing a real device.

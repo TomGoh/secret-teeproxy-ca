@@ -18,16 +18,12 @@ impl ServerConfig {
     /// Default port — matches what `scripts/deploy-teeproxyd.sh` and
     /// `tools/teeproxyd/` start the CA with, so `secret_proxy_ca serve`
     /// with no `--port` flag binds the same port the production
-    /// pipeline uses. Pre-refactor default was 18790; the divergence
-    /// between "code default" and "deploy default" caused confusion
-    /// during manual smoke tests on-device. Aligning them removes one
-    /// class of "wait, which port?" bug.
+    /// pipeline uses.
     pub const DEFAULT_PORT: u16 = 19030;
 
     /// Parse serve-mode CLI arguments (the slice after `serve`).
-    /// Unknown flags are silently ignored — `parse_arg_u32` only looks
-    /// for a matching `--flag value` window. Matches the pre-refactor
-    /// behavior at serve.rs:95.
+    /// Unknown flags are silently ignored — [`parse_arg_u32`] only
+    /// matches the `[flag, value]` window it's asked about.
     pub fn from_args(args: &[String]) -> Self {
         let port = parse_arg_u32(args, "--port")
             .map(|p| p as u16)
@@ -55,8 +51,8 @@ mod tests {
 
     #[test]
     fn unknown_flags_are_ignored() {
-        // The pre-refactor `parse_arg_u32` only matches the specific
-        // flag it's asked about; stray flags don't abort startup.
+        // `parse_arg_u32` only matches the specific flag it's asked
+        // about; stray flags don't abort startup.
         let args = vec![
             "--unknown".into(),
             "garbage".into(),

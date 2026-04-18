@@ -21,24 +21,23 @@
 //! size-lines, and a `chunk_remaining` counter to carry unfinished chunk
 //! payloads across `feed()` calls.
 //!
-//! # Lenient fallback
+//! # Lenient fallback (load-bearing)
 //!
-//! The previous (pre-refactor) implementation in `serve.rs` had the subtle
-//! guarantee: **if framing parse fails for any reason, dump the whole
-//! pending buffer as raw bytes**. This tolerance exists because the CA can't
-//! always trust upstream's chunked signal, and "garbage in → garbage out"
-//! is preferred over dropping data. We preserve that behavior exactly.
+//! **If framing parse fails for any reason, dump the whole pending
+//! buffer as raw bytes.** This tolerance exists because the CA can't
+//! always trust upstream's chunked signal, and "garbage in → garbage
+//! out" is preferred over dropping data when openclaw is waiting for
+//! an SSE frame.
 //!
-//! Any future move to a Strict mode (panic or Err on malformed input) should
-//! be a new variant of [`DecoderMode`] and a separate Step, not a silent
+//! Any future move to a Strict mode (panic or `Err` on malformed
+//! input) must be a new [`DecoderMode`] variant, not a silent
 //! behavior change here.
 
 use log::{debug, warn};
 
-/// Decoder strictness. Currently only `Lenient` is implemented — it matches
-/// the pre-refactor behavior one-for-one. A `Strict` variant may be added
-/// later for test harnesses that want errors on malformed input instead of
-/// silent raw fallback.
+/// Decoder strictness. Currently only `Lenient` is implemented. A
+/// `Strict` variant could be added later for test harnesses that want
+/// errors on malformed input instead of silent raw fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecoderMode {
     /// On any parse failure (non-UTF-8 size line, bad hex, missing CRLF),
@@ -88,12 +87,9 @@ impl ChunkedDecoder {
     /// payload bytes. Safe to call with `&[]` (returns an empty `Vec`).
     ///
     /// In `Lenient` mode, if a parse error is encountered, the whole
-    /// pending buffer (including the just-fed slice) is returned as-is,
-    /// mimicking the pre-refactor `strip_chunked_framing` function.
+    /// pending buffer (including the just-fed slice) is returned as-is.
+    /// See module docs for why this fallback is load-bearing.
     pub fn feed(&mut self, data: &[u8]) -> Vec<u8> {
-        // Algorithm mirrors the original serve.rs::strip_chunked_framing —
-        // intentionally not "cleaner" to avoid behavior drift. Any
-        // simplifications should come in a follow-up with their own tests.
         self.pending.extend_from_slice(data);
 
         let mut result = Vec::with_capacity(self.pending.len());
@@ -216,10 +212,10 @@ impl Default for ChunkedDecoder {
 // Tests
 // ============================================================================
 //
-// Coverage targets (from Phase 2 refactor plan, Step 2):
+// Coverage targets:
 // - Single chunk within one feed
-// - Hex size line split across two feeds (critical — the pre-refactor
-//   `strip_chunked_framing` had to carry partial size-lines in `pending`)
+// - Hex size line split across two feeds (critical — partial
+//   size-lines must be carried in `pending`)
 // - Zero terminator
 // - Trailing CRLF
 // - Oversize / invalid size line → raw fallback in Lenient mode
@@ -227,8 +223,8 @@ impl Default for ChunkedDecoder {
 // - Chunk data that embeds CRLF bytes (must not be misinterpreted)
 // - Chunk payload spans across feeds (chunk_remaining carry)
 // - Empty feed is a no-op
-// - proptest: random split points of a valid encoded stream produce the
-//   same output as decoding in one shot (reference oracle).
+// - Hand-rolled "random split points" property test (see
+//   `prop_decoder_matches_reference`) against a naive reference oracle.
 // ============================================================================
 
 #[cfg(test)]
@@ -351,12 +347,12 @@ mod tests {
         // finds the first "\r\n" at offset 3, tries to parse "XY0" as hex,
         // fails, and falls back to raw.
         //
-        // Pre-refactor behavior (byte-identical preservation):
-        // `fallback_to_raw` uses `mem::take(&mut pending)` which returns the
-        // *entire* pending buffer — it does NOT fold in the partial `result`
-        // that was already decoded. So the final output is just the raw
-        // original input bytes, with any partially-decoded bytes discarded.
-        // This is surprising but matches the pre-refactor semantics exactly.
+        // `fallback_to_raw` uses `mem::take(&mut pending)` which returns
+        // the *entire* pending buffer — it does NOT fold in the partial
+        // `result` already decoded. So the final output is the raw
+        // original input bytes with any partially-decoded bytes
+        // discarded. This is surprising but deliberate: "garbage in →
+        // garbage out" beats dropping user-visible content.
         let raw = b"5\r\nhelloXY0\r\n\r\n";
         let out = d.feed(raw);
         assert_eq!(
@@ -367,10 +363,10 @@ mod tests {
 
     #[test]
     fn proptest_lite_random_split_points() {
-        // Lightweight property test (no proptest crate yet — Step 2 will
-        // add the dep in a follow-up iteration). Seed a valid encoded
-        // stream and feed it at every single byte boundary to verify the
-        // decoder reassembles the original payload byte-for-byte.
+        // Lightweight property test (no `proptest` crate dep). Seed
+        // a valid encoded stream and feed it at every single-byte
+        // boundary to verify the decoder reassembles the original
+        // payload byte-for-byte.
         let payloads: Vec<&[u8]> = vec![
             b"hello",
             b"a",

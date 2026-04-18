@@ -15,9 +15,9 @@
 //!   - non-POST on any other path → `MethodNotAllowed`
 //!   - POST on any other path (including `/`, `/proxy`) → `Proxy`
 //!
-//! Note the last rule: **any POST not explicitly matched is treated as a
-//! proxy request**. This matches the pre-refactor catch-all semantics
-//! (openclaw sends POST to `/` or `/proxy` interchangeably).
+//! Note the last rule: **any POST not explicitly matched is treated as
+//! a proxy request**. openclaw sends POST to `/` or `/proxy`
+//! interchangeably; both must route the same way.
 
 /// The action the server should take for a given (method, path) pair.
 ///
@@ -51,15 +51,14 @@ pub fn route(method: &str, path: &str) -> RouteAction {
         ("GET", "/admin/keys/slots") => RouteAction::AdminListSlots,
         ("POST", "/admin/keys/provision") => RouteAction::AdminProvision,
         ("POST", "/admin/keys/remove") => RouteAction::AdminRemove,
-        // Any POST not in the admin allow-list is treated as a proxy
-        // request. openclaw's secret-proxy-wrapper historically sends to
-        // `/` and newer code uses `/proxy`; both should route the same
-        // way. Pre-refactor serve.rs had the same catch-all shape
-        // (see the `else` branch after the admin if/else-if chain).
+        // Any POST not in the admin allow-list is a proxy request.
+        // openclaw's secret-proxy-wrapper sends to `/` or `/proxy`;
+        // both route the same way. Pytest `test_proxy_format` pins
+        // this catch-all behavior.
         ("POST", _) => RouteAction::Proxy,
-        // Everything else (GET on non-admin paths, PUT/DELETE/PATCH, etc.)
-        // is 405 Method Not Allowed. Pre-refactor code emitted this with
-        // body `{"ok":false,"error":"method not allowed for this path"}`.
+        // Everything else (GET on non-admin paths, PUT/DELETE/PATCH,
+        // etc.) is 405. The handler emits body
+        // `{"ok":false,"error":"method not allowed for this path"}`.
         _ => RouteAction::MethodNotAllowed,
     }
 }
@@ -125,9 +124,8 @@ mod tests {
 
     #[test]
     fn post_unknown_path_is_proxy_catch_all() {
-        // Per pre-refactor semantics, any POST not matched explicitly
-        // goes to the proxy handler. This is preserved even for unusual
-        // paths like /v1/messages.
+        // Any POST not matched explicitly goes to the proxy handler —
+        // unusual paths like `/v1/messages` included.
         assert_eq!(route("POST", "/v1/messages"), RouteAction::Proxy);
         assert_eq!(route("POST", "/anything"), RouteAction::Proxy);
     }

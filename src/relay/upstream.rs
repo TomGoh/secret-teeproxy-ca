@@ -16,12 +16,11 @@
 //!
 //! # Timeouts
 //!
-//! `TcpUpstream::connect` sets a 120-second read timeout to match the
-//! pre-refactor `set_read_timeout(Some(Duration::from_secs(120)))` in
-//! `serve::relay_and_stream`. The relay loop surfaces a timeout as
-//! the 504 Gateway Timeout response (see `relay::session`); longer
-//! timeouts mask upstream deadlocks as transient, shorter ones trip
-//! on slow-but-working LLM responses.
+//! `TcpUpstream::connect` sets a 120-second read timeout. The relay
+//! loop surfaces a timeout as the 504 Gateway Timeout response (see
+//! `relay::session`). Longer timeouts mask upstream deadlocks as
+//! transient; shorter ones trip on slow-but-working LLM responses.
+//! 120s is the empirically-settled middle ground.
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -41,8 +40,8 @@ pub trait Upstream {
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()>;
 }
 
-/// Production [`Upstream`] backed by a `TcpStream` with the same
-/// 120s read timeout the pre-refactor code used.
+/// Production [`Upstream`] backed by a `TcpStream` with a 120s read
+/// timeout (see module docs for rationale).
 pub struct TcpUpstream {
     tcp: TcpStream,
 }
