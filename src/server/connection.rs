@@ -9,6 +9,7 @@
 use std::io::{BufReader, Write};
 use std::mem;
 use std::net::TcpStream;
+use std::time::Duration;
 
 use cc_teec::raw;
 use log::{debug, info, warn};
@@ -150,6 +151,25 @@ struct HealthTa {
 
 /// Handle one HTTP connection: read request, optional admin API, or TEEC relay + SSE.
 pub(crate) fn handle_connection(teec: &mut dyn Teec, mut client: TcpStream) -> Result<(), String> {
+    // Per-connection read deadline: the accept loop is single-threaded, so a
+    // stuck `read_line` inside `parse_request` would hang every subsequent
+    // client (including `/health`). 3s is generous for normal request
+    // assembly — openclaw sends a ~100KB JSON body serialized in-memory in
+    // one go, well under 1s even on 3G — but short enough that
+    // `test_slow_drip_doesnt_block_health`'s 5s /health deadline is
+    // reachable once the slow-drip client times out. See
+    // tests/chaos/test_adversarial.py.
+    //
+    // Intentionally no `set_write_timeout`: SSE responses are long-lived by
+    // design (multi-turn streaming), and a short write timeout would cut
+    // them off mid-stream.
+    //
+    // This bounds slow-drip DoS but does NOT fix the 100-idle case
+    // (test_100_idle_connections_no_hang) — that requires concurrent accept
+    // (Phase 2 session pool) because the sum of per-connection timeouts
+    // across a queued backlog is unavoidable on a single-threaded loop.
+    let _ = client.set_read_timeout(Some(Duration::from_secs(3)));
+
     let mut reader = BufReader::new(&client);
     let req = crate::http::request::parse_request(&mut reader)?;
     let http_method = req.method;

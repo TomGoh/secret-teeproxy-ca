@@ -95,14 +95,13 @@ jobs:
 
   # -------------------------------------------------------------------
   # Coverage measurement. Runs the same test command as the `test` job
-  # but through `cargo llvm-cov`. Posts a summary on the PR; doesn't
-  # fail on coverage drop (yet) — we'll ratchet thresholds once we
-  # have a baseline.
+  # but through `cargo llvm-cov`, and FAILS the PR if line coverage
+  # drops below the baseline threshold (see coverage/BASELINE.md for
+  # the 74.77% baseline and the 72% threshold rationale).
   # -------------------------------------------------------------------
   coverage:
     name: coverage (llvm-cov)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -111,5 +110,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Run coverage
-        run: cargo llvm-cov --features test-support --all-targets --summary-only
+      - name: Run coverage with threshold
+        # --fail-under-lines 72 = baseline 74.77% minus 2.77 pt ratchet.
+        # Ratchet upward when coverage improves; see coverage/BASELINE.md.
+        run: cargo llvm-cov --features test-support --all-targets --summary-only --fail-under-lines 72
