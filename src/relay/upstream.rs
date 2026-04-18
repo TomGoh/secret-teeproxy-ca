@@ -78,7 +78,7 @@ impl Upstream for TcpUpstream {
 
 #[cfg(any(test, feature = "test-support"))]
 mod mock {
-    use super::{Read, Write, io};
+    use super::io;
     use std::collections::VecDeque;
 
     /// One scripted result for the next `read()` call. Variants:

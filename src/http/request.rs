@@ -11,7 +11,7 @@
 //! preserved exactly (same method uppercasing, same Content-Length lookup,
 //! same body read-to-completion); the wire format is not touched.
 
-use std::io::{BufRead, Read};
+use std::io::BufRead;
 
 use super::headers::normalize_http_path;
 

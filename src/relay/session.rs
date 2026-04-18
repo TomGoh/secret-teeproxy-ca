@@ -41,13 +41,19 @@ use crate::teec::Teec;
 /// Run the full TEEC ↔ upstream ↔ client relay loop.
 ///
 /// Wire behavior is pytest-pinned — the smoke/format/recovery suite
-/// in `tests/` is the acceptance gate for any change here.
+/// in `tests/` is the acceptance gate for any change here. For
+/// hermetic (non-device) testing, drive this with [`MockTeec`]
+/// + [`MockUpstream`] + any `impl Write` (e.g. `Vec<u8>`) — see
+/// `tests/serve_proxy_sse.rs`.
 ///
 /// Returns `Ok(())` on clean BIZ_RELAY_DONE. Any other exit — upstream
 /// EOF before DONE, TCP error, TA error, state-machine error, client
 /// write failure — returns `Err(msg)` and (when applicable) has already
 /// written an HTTP error response to `client` via [`send_error`].
-pub(crate) fn run_relay_loop<U, W>(
+///
+/// [`MockTeec`]: crate::teec::mock::MockTeec
+/// [`MockUpstream`]: crate::relay::upstream::MockUpstream
+pub fn run_relay_loop<U, W>(
     teec: &mut dyn Teec,
     upstream: &mut U,
     client: &mut W,
@@ -281,9 +287,7 @@ fn log_decoded_events(bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::{
-        BIZ_RELAY_CONTINUE, BIZ_RELAY_DONE, BIZ_RELAY_STREAMING, BIZ_SUCCESS,
-    };
+    use crate::constants::{BIZ_RELAY_CONTINUE, BIZ_RELAY_DONE, BIZ_RELAY_STREAMING};
     use crate::relay::upstream::MockUpstream;
     use crate::teec::mock::{MockTeec, ScriptedResponse};
 

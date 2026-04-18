@@ -22,10 +22,12 @@ libc = "0.2"
 thiserror = "1"
 
 [features]
-# Expose test-only mocks (currently `teec::mock::MockTeec`) to integration
-# tests under `tools/secret_proxy_ca/tests/`. Always active under
-# `#[cfg(test)]` for unit tests inside this crate; the feature flag exists
-# for the Step 10 integration tests. Keeping the declaration here now so
-# `cargo check --cfg feature="test-support"` stops emitting the unexpected-
-# cfg warning introduced in Step 5.
+# Expose test-only mocks (`teec::mock::MockTeec`,
+# `relay::upstream::MockUpstream`, `clock::MockClock`) to integration
+# tests under `tests/`. Always active under `#[cfg(test)]` for unit
+# tests inside this crate; enable with `--features test-support` to
+# make the mocks visible to the integration test binaries.
+#
+# Run integration tests with:
+#   cargo test --features test-support
 test-support = []
