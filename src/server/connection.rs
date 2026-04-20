@@ -334,49 +334,31 @@ pub(crate) fn handle_connection(teec: &mut dyn Teec, mut client: TcpStream) -> R
             key: parsed.key,
             provider: parsed.provider,
         };
-        match teec_provision_key(teec, &payload) {
-            Ok(()) => {
-                let slot_id = payload.slot;
-                let (verified, slots, slot_entries, verification_warning) =
-                    match (teec_list_slots(teec), teec_list_slots_meta(teec)) {
-                        (Ok(s), Ok(e)) => {
-                            let v = s.contains(&slot_id);
-                            (v, s, e, None)
-                        }
-                        (Ok(s), Err(e)) => {
-                            warn!("admin provision: post-verify meta failed: {e}");
-                            (s.contains(&slot_id), s, Vec::new(), Some(e))
-                        }
-                        (Err(e), _) => {
-                            warn!("admin provision: post-verify list failed: {e}");
-                            (
-                                false,
-                                Vec::new(),
-                                Vec::new(),
-                                Some(format!("post-provision list_slots failed: {e}")),
-                            )
-                        }
-                    };
-                info!(
-                    "audit event=admin_provision result=ok actor={} request_id={} source={} slot={} verified={} slots_count={}",
-                    audit_ctx.actor,
-                    audit_ctx.request_id,
-                    audit_ctx.source,
-                    slot_id,
-                    verified,
-                    slots.len(),
+        // Try once, and if we hit a TEEC communication transient (x-kernel knet
+        // occasionally drops the TA→bridge response even though the TA committed
+        // the write), retry once after a short delay. TA provision is idempotent
+        // under TEE_DATA_FLAG_OVERWRITE, so re-sending the same payload is safe.
+        let retry_warning = match teec_provision_key(teec, &payload) {
+            Ok(()) => None,
+            Err(e) if e.contains("0xffff000e") => {
+                warn!(
+                    "admin provision: transient TEEC comms error (`{e}`); retrying in 500ms"
                 );
-                let json = serde_json::to_string(&AdminOkProvision {
-                    ok: true,
-                    slot: slot_id,
-                    verified,
-                    slots,
-                    slot_entries,
-                    verification_warning,
-                })
-                .unwrap_or_else(|_| r#"{"ok":false}"#.into());
-                send_json_response(&mut client, 200, "OK", &json);
-                Ok(())
+                std::thread::sleep(Duration::from_millis(500));
+                match teec_provision_key(teec, &payload) {
+                    Ok(()) => Some(format!("recovered after initial transient: {e}")),
+                    Err(e2) => {
+                        // Both attempts failed — fall through to the outer Err path.
+                        let combined = format!("initial: {e}; retry: {e2}");
+                        let msg = serde_json::json!({ "ok": false, "error": combined }).to_string();
+                        send_json_response(&mut client, 502, "Bad Gateway", &msg);
+                        warn!(
+                            "audit event=admin_provision result=error actor={} request_id={} source={} slot={} error={combined}",
+                            audit_ctx.actor, audit_ctx.request_id, audit_ctx.source, payload.slot
+                        );
+                        return Err(combined);
+                    }
+                }
             }
             Err(e) => {
                 let msg = serde_json::json!({ "ok": false, "error": e }).to_string();
@@ -385,9 +367,51 @@ pub(crate) fn handle_connection(teec: &mut dyn Teec, mut client: TcpStream) -> R
                     "audit event=admin_provision result=error actor={} request_id={} source={} slot={} error={}",
                     audit_ctx.actor, audit_ctx.request_id, audit_ctx.source, payload.slot, e
                 );
-                Err(e)
+                return Err(e);
             }
-        }
+        };
+
+        let slot_id = payload.slot;
+        let (verified, slots, slot_entries, verification_warning) =
+            match (teec_list_slots(teec), teec_list_slots_meta(teec)) {
+                (Ok(s), Ok(e)) => (s.contains(&slot_id), s, e, retry_warning.clone()),
+                (Ok(s), Err(e)) => {
+                    warn!("admin provision: post-verify meta failed: {e}");
+                    let w = match &retry_warning {
+                        Some(r) => format!("{r}; meta: {e}"),
+                        None => e,
+                    };
+                    (s.contains(&slot_id), s, Vec::new(), Some(w))
+                }
+                (Err(e), _) => {
+                    warn!("admin provision: post-verify list failed: {e}");
+                    let w = match &retry_warning {
+                        Some(r) => format!("{r}; list: {e}"),
+                        None => format!("post-provision list_slots failed: {e}"),
+                    };
+                    (false, Vec::new(), Vec::new(), Some(w))
+                }
+            };
+        info!(
+            "audit event=admin_provision result=ok actor={} request_id={} source={} slot={} verified={} slots_count={}",
+            audit_ctx.actor,
+            audit_ctx.request_id,
+            audit_ctx.source,
+            slot_id,
+            verified,
+            slots.len(),
+        );
+        let json = serde_json::to_string(&AdminOkProvision {
+            ok: true,
+            slot: slot_id,
+            verified,
+            slots,
+            slot_entries,
+            verification_warning,
+        })
+        .unwrap_or_else(|_| r#"{"ok":false}"#.into());
+        send_json_response(&mut client, 200, "OK", &json);
+        Ok(())
     } else if path == "/admin/keys/remove" && http_method == "POST" {
         if let Err(reason) = check_admin_token(&headers_text) {
             let status = if reason.contains("disabled") {
