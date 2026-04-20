@@ -341,9 +341,7 @@ pub(crate) fn handle_connection(teec: &mut dyn Teec, mut client: TcpStream) -> R
         let retry_warning = match teec_provision_key(teec, &payload) {
             Ok(()) => None,
             Err(e) if e.contains("0xffff000e") => {
-                warn!(
-                    "admin provision: transient TEEC comms error (`{e}`); retrying in 500ms"
-                );
+                warn!("admin provision: transient TEEC comms error (`{e}`); retrying in 500ms");
                 std::thread::sleep(Duration::from_millis(500));
                 match teec_provision_key(teec, &payload) {
                     Ok(()) => Some(format!("recovered after initial transient: {e}")),
