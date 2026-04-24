@@ -20,6 +20,7 @@
 //!     ├─ GET  /admin/keys/slots    → teec_list_slots (token required)
 //!     ├─ POST /admin/keys/provision → teec_provision_key (token required)
 //!     ├─ POST /admin/keys/remove   → teec_remove_key (token required)
+//!     ├─ POST /admin/whitelist/add → teec_add_whitelist (token required)
 //!     └─ POST /                    → handle_proxy_post
 //!                                    → CMD_PROXY_REQUEST to TA
 //!                                    → relay::session::run_relay_loop
@@ -100,6 +101,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     info!(
         "admin: GET /admin/keys/slots, POST /admin/keys/provision, POST /admin/keys/remove (requires {ADMIN_TOKEN_ENV})"
     );
+    info!("admin: POST /admin/whitelist/add (requires {ADMIN_TOKEN_ENV})");
 
     for stream in listener.incoming() {
         match stream {

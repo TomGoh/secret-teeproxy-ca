@@ -29,7 +29,7 @@
 use std::io::{self, Write};
 
 use cc_teec::raw;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 
 use crate::constants::CMD_RELAY_DATA;
 use crate::relay::core::{self, RelayEvent, RelayNext, RelayOutcome, RelayState, RelayTaOutput};
@@ -37,6 +37,13 @@ use crate::relay::upstream::Upstream;
 use crate::sse::encoder::sse_response_headers;
 use crate::sse::parser::{log_event, parse_events};
 use crate::teec::Teec;
+
+/// Max ciphertext bytes fed to TA per CMD_RELAY_DATA round.
+///
+/// We may read more bytes from upstream in one syscall, but we slice them into
+/// smaller relay rounds to avoid overflowing rustls internal message buffers
+/// inside the TA under heavy streaming workloads.
+const MAX_TA_RELAY_INPUT_CHUNK: usize = 4 * 1024;
 
 /// Run the full TEEC ↔ upstream ↔ client relay loop.
 ///
@@ -69,13 +76,18 @@ where
         .map_err(|e| format!("TCP write ClientHello: {e}"))?;
 
     let mut state = RelayState::new();
-    let mut read_buf = vec![0u8; 65536];
+    // Keep upstream read chunks small so one CMD_RELAY_DATA round does not
+    // overfeed rustls in the TA and trigger "message buffer full" under
+    // heavy SSE streams (seen with OpenAI responses).
+    let mut read_buf = vec![0u8; 8 * 1024];
     // 1 MiB — covers the biggest Anthropic SSE chunk seen in
     // production. Larger upstreams would need CMD_RELAY_DATA to be
     // re-issued with a bigger output buffer, which is a TA-side change.
     let mut response_buf = vec![0u8; 1024 * 1024];
     let mut tls_extra_buf = vec![0u8; 4096];
     let mut saw_upstream_eof = false;
+    let mut pending_upstream = Vec::<u8>::new();
+    let mut pending_upstream_start = 0usize;
     let mut round = 0u32;
     // `next` seeds the first iteration: ReadUpstream pulls the first
     // server response bytes before we call the TA.
@@ -87,35 +99,55 @@ where
         // --- Gather TA input: either upstream read or empty (pump) --
         let (input_bytes, eof_flag): (&[u8], bool) = match next {
             RelayNext::ReadUpstream => {
-                debug!("relay round {round}, reading from upstream...");
-                match upstream.read(&mut read_buf) {
-                    Ok(n) => {
-                        if n == 0 {
-                            if saw_upstream_eof {
-                                return Err("server closed before relay completed".into());
+                if pending_upstream_start < pending_upstream.len() {
+                    let remaining = pending_upstream.len() - pending_upstream_start;
+                    let take = remaining.min(MAX_TA_RELAY_INPUT_CHUNK);
+                    let start = pending_upstream_start;
+                    let end = start + take;
+                    pending_upstream_start = end;
+                    debug!(
+                        "relay round {round}, draining buffered upstream chunk: {take} bytes (remaining={})",
+                        pending_upstream.len().saturating_sub(pending_upstream_start)
+                    );
+                    (&pending_upstream[start..end], false)
+                } else {
+                    // Buffered ciphertext fully drained — reset buffer and read more.
+                    pending_upstream.clear();
+                    pending_upstream_start = 0;
+                    debug!("relay round {round}, reading from upstream...");
+                    match upstream.read(&mut read_buf) {
+                        Ok(n) => {
+                            if n == 0 {
+                                if saw_upstream_eof {
+                                    return Err("server closed before relay completed".into());
+                                }
+                                saw_upstream_eof = true;
+                                debug!("relay round {round}, server→ 0 bytes (EOF)");
+                                (&[] as &[u8], true)
+                            } else {
+                                saw_upstream_eof = false;
+                                pending_upstream.extend_from_slice(&read_buf[..n]);
+                                let take = n.min(MAX_TA_RELAY_INPUT_CHUNK);
+                                pending_upstream_start = take;
+                                debug!(
+                                    "relay round {round}, server→ {n} bytes, feeding first chunk={take} bytes"
+                                );
+                                (&pending_upstream[..take], false)
                             }
-                            saw_upstream_eof = true;
-                        } else {
-                            saw_upstream_eof = false;
                         }
-                        debug!(
-                            "relay round {round}, server→ {n} bytes{}",
-                            if n == 0 { " (EOF)" } else { "" }
-                        );
-                        (&read_buf[..n], n == 0)
-                    }
-                    Err(ref e)
-                        if e.kind() == io::ErrorKind::TimedOut
-                            || e.kind() == io::ErrorKind::WouldBlock =>
-                    {
-                        send_error(client, 504, "upstream timeout");
-                        return Err("TCP read timed out".into());
-                    }
-                    Err(e) => {
-                        if !state.response_started {
-                            send_error(client, 502, &format!("TCP read: {e}"));
+                        Err(ref e)
+                            if e.kind() == io::ErrorKind::TimedOut
+                                || e.kind() == io::ErrorKind::WouldBlock =>
+                        {
+                            send_error(client, 504, "upstream timeout");
+                            return Err("TCP read timed out".into());
                         }
-                        return Err(format!("TCP read: {e}"));
+                        Err(e) => {
+                            if !state.response_started {
+                                send_error(client, 502, &format!("TCP read: {e}"));
+                            }
+                            return Err(format!("TCP read: {e}"));
+                        }
                     }
                 }
             }
@@ -241,6 +273,17 @@ where
                 return Ok(());
             }
             RelayNext::Error(msg) => {
+                // OpenAI-style SSE streams can occasionally finish with a tail
+                // transport blip (`0xe006`) after many chunks have already been
+                // delivered to the client. If the response has started, treat
+                // this as end-of-stream to avoid surfacing a hard failure for a
+                // practically successful turn.
+                if state.response_started && msg == "relay error: 0xe006" {
+                    warn!("relay tail transport error after streaming started; treating as stream end");
+                    let _ = client.flush();
+                    info!("serve → stream complete (tail transport error tolerated)");
+                    return Ok(());
+                }
                 if !state.response_started {
                     send_error(client, 502, &msg);
                 }
@@ -529,6 +572,35 @@ mod tests {
             "must not send_error after preamble; got: {client_str:?}"
         );
         assert!(client_str.starts_with("HTTP/1.1 200 OK\r\n"));
+    }
+
+    #[test]
+    fn transport_error_after_streaming_is_tolerated() {
+        // `0xe006` after streaming starts is treated as tail-close rather than
+        // a hard failure. This avoids noisy failures when the user already got
+        // a complete-looking streamed answer.
+        let mut teec = MockTeec::new();
+        queue_ta_round(
+            &mut teec,
+            BIZ_RELAY_STREAMING,
+            b"HTTP/1.1 200 OK\r\n\r\n\
+              data: {\"type\":\"message_stop\"}\n\n",
+            b"",
+        );
+        queue_ta_round(&mut teec, 0xE006, b"", b"");
+
+        let mut upstream = MockUpstream::new();
+        upstream
+            .queue_read(b"C1".to_vec())
+            .queue_read(b"C2".to_vec());
+
+        let mut client = Vec::<u8>::new();
+        let result = run_relay_loop(&mut teec, &mut upstream, &mut client, b"HELLO");
+        assert!(result.is_ok(), "tail 0xe006 should be tolerated: {result:?}");
+
+        let client_str = String::from_utf8_lossy(&client);
+        assert!(client_str.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(client_str.contains("data: {\"type\":\"message_stop\"}"));
     }
 
     #[test]

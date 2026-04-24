@@ -72,8 +72,8 @@ pub(crate) use constants::{
 };
 #[allow(unused_imports)]
 pub(crate) use teec::ops::{
-    check_teec_rc, ta_error_layer, teec_list_slots, teec_list_slots_meta, teec_provision_key,
-    teec_remove_key,
+    check_teec_rc, ta_error_layer, teec_add_whitelist, teec_list_slots, teec_list_slots_meta,
+    teec_provision_key, teec_remove_key,
 };
 #[allow(unused_imports)]
 pub(crate) use wire::{HttpMethod, ProvisionKeyPayload, ProxyRequest, ProxyResponse, SlotEntry};

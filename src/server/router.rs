@@ -12,6 +12,7 @@
 //!   - `GET /admin/keys/slots` → `AdminListSlots`
 //!   - `POST /admin/keys/provision` → `AdminProvision`
 //!   - `POST /admin/keys/remove` → `AdminRemove`
+//!   - `POST /admin/whitelist/add` → `AdminAddWhitelist`
 //!   - non-POST on any other path → `MethodNotAllowed`
 //!   - POST on any other path (including `/`, `/proxy`) → `Proxy`
 //!
@@ -35,6 +36,8 @@ pub enum RouteAction {
     AdminProvision,
     /// `POST /admin/keys/remove` — admin token required, body carries slot.
     AdminRemove,
+    /// `POST /admin/whitelist/add` — admin token required, body carries pattern.
+    AdminAddWhitelist,
     /// `POST` to any unmatched path — treated as a proxy request.
     Proxy,
     /// Request did not match any known route and cannot be handled
@@ -51,6 +54,7 @@ pub fn route(method: &str, path: &str) -> RouteAction {
         ("GET", "/admin/keys/slots") => RouteAction::AdminListSlots,
         ("POST", "/admin/keys/provision") => RouteAction::AdminProvision,
         ("POST", "/admin/keys/remove") => RouteAction::AdminRemove,
+        ("POST", "/admin/whitelist/add") => RouteAction::AdminAddWhitelist,
         // Any POST not in the admin allow-list is a proxy request.
         // openclaw's secret-proxy-wrapper sends to `/` or `/proxy`;
         // both route the same way. Pytest `test_proxy_format` pins
@@ -111,6 +115,14 @@ mod tests {
         assert_eq!(
             route("GET", "/admin/keys/provision"),
             RouteAction::MethodNotAllowed
+        );
+    }
+
+    #[test]
+    fn post_admin_whitelist_add() {
+        assert_eq!(
+            route("POST", "/admin/whitelist/add"),
+            RouteAction::AdminAddWhitelist
         );
     }
 
