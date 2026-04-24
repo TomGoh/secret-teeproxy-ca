@@ -17,9 +17,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::teec::Teec;
 use crate::{
-    check_teec_rc, ta_error_layer, teec_list_slots, teec_list_slots_meta, teec_provision_key,
-    teec_remove_key, HttpMethod, ProvisionKeyPayload, ProxyRequest, SlotEntry, ADMIN_ACTOR_HEADER,
-    ADMIN_REQUEST_ID_HEADER, BIZ_RELAY_START, CMD_PROXY_REQUEST,
+    check_teec_rc, ta_error_layer, teec_add_whitelist, teec_list_slots, teec_list_slots_meta,
+    teec_provision_key, teec_remove_key, HttpMethod, ProvisionKeyPayload, ProxyRequest, SlotEntry,
+    ADMIN_ACTOR_HEADER, ADMIN_REQUEST_ID_HEADER, BIZ_RELAY_START, CMD_PROXY_REQUEST,
 };
 
 #[derive(Clone, Debug)]
@@ -91,6 +91,11 @@ struct AdminRemoveBody {
     slot: u32,
 }
 
+#[derive(Deserialize)]
+struct AdminWhitelistPatternBody {
+    pattern: String,
+}
+
 #[derive(Serialize)]
 struct AdminOkProvision {
     ok: bool,
@@ -121,6 +126,13 @@ struct AdminOkRemove {
     slot_entries: Vec<SlotEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     verification_warning: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AdminOkWhitelistMutate {
+    ok: bool,
+    pattern: String,
+    added: bool,
 }
 
 #[derive(Serialize)]
@@ -486,6 +498,64 @@ pub(crate) fn handle_connection(teec: &mut dyn Teec, mut client: TcpStream) -> R
                 warn!(
                     "audit event=admin_remove result=error actor={} request_id={} source={} slot={} error={}",
                     audit_ctx.actor, audit_ctx.request_id, audit_ctx.source, parsed.slot, e
+                );
+                Err(e)
+            }
+        }
+    } else if path == "/admin/whitelist/add" && http_method == "POST" {
+        if let Err(reason) = check_admin_token(&headers_text) {
+            let status = if reason.contains("disabled") {
+                503
+            } else {
+                401
+            };
+            let text = if status == 503 {
+                "Service Unavailable"
+            } else {
+                "Unauthorized"
+            };
+            let msg = serde_json::json!({ "ok": false, "error": reason }).to_string();
+            send_json_response(&mut client, status, text, &msg);
+            warn!(
+                "audit event=admin_whitelist_add result=deny actor={} request_id={} source={} reason={}",
+                audit_ctx.actor, audit_ctx.request_id, audit_ctx.source, reason
+            );
+            return Err(reason.into());
+        }
+        let parsed: AdminWhitelistPatternBody = match serde_json::from_slice(&body) {
+            Ok(p) => p,
+            Err(e) => {
+                let msg = serde_json::json!({ "ok": false, "error": format!("invalid JSON: {e}") })
+                    .to_string();
+                send_json_response(&mut client, 400, "Bad Request", &msg);
+                warn!(
+                    "audit event=admin_whitelist_add result=error actor={} request_id={} source={} reason=bad_json",
+                    audit_ctx.actor, audit_ctx.request_id, audit_ctx.source
+                );
+                return Err(format!("admin whitelist add bad JSON: {e}"));
+            }
+        };
+        match teec_add_whitelist(teec, &parsed.pattern) {
+            Ok(()) => {
+                info!(
+                    "audit event=admin_whitelist_add result=ok actor={} request_id={} source={} pattern={}",
+                    audit_ctx.actor, audit_ctx.request_id, audit_ctx.source, parsed.pattern
+                );
+                let json = serde_json::to_string(&AdminOkWhitelistMutate {
+                    ok: true,
+                    pattern: parsed.pattern,
+                    added: true,
+                })
+                .unwrap_or_else(|_| r#"{"ok":false}"#.into());
+                send_json_response(&mut client, 200, "OK", &json);
+                Ok(())
+            }
+            Err(e) => {
+                let msg = serde_json::json!({ "ok": false, "error": e }).to_string();
+                send_json_response(&mut client, 502, "Bad Gateway", &msg);
+                warn!(
+                    "audit event=admin_whitelist_add result=error actor={} request_id={} source={} pattern={} error={}",
+                    audit_ctx.actor, audit_ctx.request_id, audit_ctx.source, parsed.pattern, e
                 );
                 Err(e)
             }
